@@ -6,16 +6,58 @@
 #
 # Hardware requirement: 1-2 GPUs (can run on single GPU with devices: "0" for both)
 
+# Model configuration reference (for documentation)
+# Actual values are set in hf_overrides below
+#
+# Token configuration:
+#   text_max: 151688              # Maximum text token ID (inclusive)
+#   audio_start: 151696           # First audio token ID in absolute vocabulary
+#   audio_vocab_size: 6562        # Total number of audio tokens
+#   audio_eos: 6561               # Audio EOS token ID (relative to audio_start)
+#   audio_patch_token_id: 151690  # <audio_patch> placeholder token ID
+#
+# Encoder configuration:
+#   n_mels: 128                   # Number of mel frequency bins
+#   n_audio_ctx: 1500             # Audio context length
+#   n_audio_state: 512            # Audio encoder hidden state dimension
+#   n_audio_head: 8               # Number of attention heads
+#   n_audio_layer: 6              # Number of encoder layers
+#   kernel_size: 3                # Convolution kernel size for adapter
+#   adapter_stride: 2             # Stride for adapter convolution
+
 stage_args:
   # Stage 0: Thinker (Audio Understanding + Token Generation)
   - stage_id: 0
     runtime:
       process: true              # Run in separate process
-      devices: "0"              # GPU device (CUDA_VISIBLE_DEVICES)
+      devices: "0,1,2,3"          # Use 3 GPUs for tensor parallelism
       max_batch_size: 1         # Single sample at a time
     engine_args:
       model_stage: thinker
       model_arch: StepAudio2ThinkerForConditionalGeneration
+      tensor_parallel_size: 4   # Split model across 3 GPUs
+      hf_overrides:
+        architectures: ["Qwen2ForCausalLM"]
+        # NOTE: All default values are defined in step_audio2_constants.py (DEFAULT_MODEL_CONFIG)
+        # Only override here if your model differs from the defaults
+        #
+        # Default values (for reference, from constants.py):
+        #   hidden_size: 4096              # Qwen2-7B (change to 1536 for 1.5B, 896 for 0.5B)
+        #   text_max: 151688
+        #   audio_start: 151696
+        #   audio_vocab_size: 6562
+        #   audio_eos: 6561
+        #   audio_patch_token_id: 151690
+        #   n_mels: 128
+        #   n_audio_ctx: 1500
+        #   n_audio_state: 512
+        #   n_audio_head: 8
+        #   n_audio_layer: 6
+        #   kernel_size: 3
+        #   adapter_stride: 2
+        #
+        # Uncomment and modify only if needed:
+        # hidden_size: 4096
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
@@ -40,13 +82,14 @@ stage_args:
   - stage_id: 1
     runtime:
       process: true
-      devices: "1"              # Use different GPU (or "0" for single GPU)
+      devices: "3"              # Use GPU 3 (separate from Stage 0's 0-2)
       max_batch_size: 1
     engine_args:
       model_stage: token2wav
       model_arch: StepAudio2Token2WavModel
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+
       gpu_memory_utilization: 0.3  # Token2Wav needs less memory
       enforce_eager: true
       trust_remote_code: true

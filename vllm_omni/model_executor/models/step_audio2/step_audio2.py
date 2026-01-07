@@ -1,9 +1,7 @@
-import os
 from typing import Optional, Union
+
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
@@ -12,9 +10,9 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from .step_audio2_thinker import (
+    StepAudio2DummyInputsBuilder,
     StepAudio2MultiModalProcessor,
     StepAudio2ProcessingInfo,
-    StepAudio2DummyInputsBuilder,
 )
 
 logger = init_logger(__name__)
@@ -49,6 +47,8 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Mark that this model has multimodal outputs (required by vLLM-Omni framework)
+        self.have_multimodal_outputs = True
 
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -80,30 +80,29 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "token2wav"),
                 hf_config=config,
-                architectures=["StepAudio2Token2WavModel"],
+                architectures=["StepAudio2Token2WavForConditionalGeneration"],
             )
             self.model = self.token2wav
 
             logger.info("Initialized Step-Audio2 Token2Wav (Stage 2)")
 
         else:
-            raise ValueError(
-                f"Invalid model_stage: {self.model_stage}. "
-                f"Must be 'thinker' or 'token2wav'"
-            )
+            raise ValueError(f"Invalid model_stage: {self.model_stage}. Must be 'thinker' or 'token2wav'")
 
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
-            self.thinker.make_empty_intermediate_tensors
-            if self.model_stage == "thinker"
-            else lambda: None
+            self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
-        """Get placeholder string for a modality"""
+        """Get placeholder string for a modality
+
+        Returns:
+            For audio: "<audio_patch>" (matches processor's audio_token)
+        """
         if modality == "audio":
-            return f"<|audio_{i}|>"
+            return "<audio_patch>"
         return None
 
     def get_language_model(self) -> nn.Module:
@@ -129,7 +128,7 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Forward pass through the model
@@ -144,7 +143,7 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            **kwargs
+            **kwargs,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

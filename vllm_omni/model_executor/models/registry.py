@@ -67,7 +67,7 @@ _OMNI_MODELS = {
     "StepAudio2Token2WavModel": (
         "step_audio2",
         "step_audio2_token2wav",
-        "StepAudio2Token2WavForConditionalGenerationVLLM",
+        "StepAudio2Token2WavForConditionalGeneration",
     ),
 }
 

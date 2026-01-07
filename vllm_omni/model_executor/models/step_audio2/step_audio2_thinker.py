@@ -1,20 +1,34 @@
+"""
+Step-Audio2 Thinker - Stage 1 LLM for Audio Understanding
+
+This file contains:
+- Audio encoder components (AudioEncoder, Adaptor)
+- Audio preprocessing utilities (mel-spectrogram extraction)
+- Multi-modal processing (StepAudio2MultiModalProcessor)
+- Main thinker model (StepAudio2ThinkerForConditionalGeneration)
+"""
+
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping, Sequence
-from functools import cached_property
-from typing import Optional, List, Tuple, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+import librosa
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoTokenizer
+from transformers.processing_utils import ProcessorMixin
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import (
+    flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
     merge_multimodal_embeddings,
-    flatten_bn,
 )
-from vllm.sequence import IntermediateTensors
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
@@ -28,37 +42,412 @@ from vllm.multimodal.processing import (
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
-    PromptUpdateDetails,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from .step_audio2_encoder import AudioEncoder, Adaptor
+from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
+    DEFAULT_MODEL_CONFIG,
+    DEFAULT_TOKEN_CONFIG,
+    STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID,
+)
 
-logger = init_logger(__name__)
-
-
-# Step-Audio2 token ranges
-STEP_AUDIO2_TEXT_MAX = 151688
-STEP_AUDIO2_AUDIO_START = 151696
-STEP_AUDIO2_AUDIO_VOCAB_SIZE = 6562
-STEP_AUDIO2_AUDIO_EOS = 6561
-AUDIO_PATCH_TOKEN_ID = 151690  # <audio_patch> token
+if TYPE_CHECKING:
+    pass
 
 
-class Step1fAudioInputs(TypedDict):
+# ============================================================================
+# Audio Preprocessing Utilities
+# ============================================================================
+
+
+def _mel_filters(n_mels: int) -> torch.Tensor:
+    """Generate mel filter banks"""
+    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
+    return torch.from_numpy(librosa.filters.mel(sr=16000, n_fft=400, n_mels=n_mels))
+
+
+def _normalize_audio(audio: Any) -> torch.Tensor:
+    """Normalize audio to torch.Tensor"""
+    if isinstance(audio, tuple):
+        audio = audio[0]
+    if isinstance(audio, np.ndarray):
+        audio = torch.from_numpy(audio)
+    elif not torch.is_tensor(audio):
+        audio = torch.tensor(audio, dtype=torch.float32)
+    return audio.float()
+
+
+def log_mel_spectrogram(audio: Any, n_mels: int = 128, padding: int = 479) -> torch.Tensor:
+    """
+    Convert audio to log mel-spectrogram
+
+    Args:
+        audio: Audio waveform (any format)
+        n_mels: Number of mel frequency bins (default: 128)
+        padding: Right padding for STFT (default: 479)
+
+    Returns:
+        Log mel-spectrogram tensor of shape (n_mels, T)
+    """
+    audio = _normalize_audio(audio)
+    if padding > 0:
+        audio = F.pad(audio, (0, padding))
+    window = torch.hann_window(400, device=audio.device)
+    stft = torch.stft(audio, 400, 160, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
+    filters = _mel_filters(n_mels).to(audio.device)
+    mel_spec = filters @ magnitudes
+
+    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+    return log_spec
+
+
+def padding_mels(data: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pad mel spectrograms to same length
+
+    Args:
+        data: List of mel spectrograms, each of shape (n_mels, T)
+
+    Returns:
+        padded_feats: Padded tensor of shape (batch, n_mels, max_T)
+        feats_lengths: Lengths of each sequence
+    """
+    feats_lengths = torch.tensor([s.size(1) - 2 for s in data], dtype=torch.int32)
+    feats = [s.t() for s in data]
+    padded_feats = pad_sequence(feats, batch_first=True, padding_value=0)
+    return padded_feats.transpose(1, 2), feats_lengths
+
+
+# ============================================================================
+# Encoder Utilities
+# ============================================================================
+
+
+def make_non_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
+    """Create non-padding mask from lengths"""
+    batch_size = lengths.size(0)
+    max_len = max_len if max_len > 0 else lengths.max().item()
+    seq_range = torch.arange(0, max_len, dtype=torch.int64, device=lengths.device)
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
+    seq_length_expand = lengths.unsqueeze(-1)
+    mask = seq_range_expand >= seq_length_expand
+    return ~mask
+
+
+def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert mask to attention bias"""
+    assert mask.dtype == torch.bool
+    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
+    mask = mask.to(dtype)
+    mask = (1.0 - mask) * -1.0e10
+    return mask
+
+
+# ============================================================================
+# Audio Encoder Components
+# ============================================================================
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head attention for audio encoder"""
+
+    def __init__(self, n_state: int, n_head: int):
+        super().__init__()
+        self.n_head = n_head
+        self.query = nn.Linear(n_state, n_state)
+        self.key = nn.Linear(n_state, n_state, bias=False)
+        self.value = nn.Linear(n_state, n_state)
+        self.out = nn.Linear(n_state, n_state)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ):
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        wv, qk = self.qkv_attention(q, k, v, mask)
+        return self.out(wv), qk
+
+    def qkv_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None):
+        _, T, D = q.shape
+        scale = (D // self.n_head) ** -0.25
+        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
+        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1) * scale
+        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+
+        qk = q @ k  # (B, n_head, T, T)
+        if mask is not None:
+            qk = qk + mask
+        qk = qk.float()
+
+        w = F.softmax(qk, dim=-1).to(q.dtype)
+        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
+
+
+class ResidualAttentionBlock(nn.Module):
+    """Residual attention block for audio encoder"""
+
+    def __init__(self, n_state: int, n_head: int):
+        super().__init__()
+
+        self.attn = MultiHeadAttention(n_state, n_head)
+        self.attn_ln = nn.LayerNorm(n_state)
+
+        n_mlp = n_state * 4
+        self.mlp = nn.Sequential(nn.Linear(n_state, n_mlp), nn.GELU(), nn.Linear(n_mlp, n_state))
+        self.mlp_ln = nn.LayerNorm(n_state)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ):
+        x = x + self.attn(self.attn_ln(x), mask=mask)[0]
+        x = x + self.mlp(self.mlp_ln(x))
+        return x
+
+
+class AudioEncoder(nn.Module):
+    """
+    Step-Audio2 Audio Encoder
+
+    Lightweight audio encoder (6 layers, 512 hidden)
+    Optimized for 25s audio chunks at 25Hz
+    """
+
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+        super().__init__()
+        self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
+        self.positional_embedding = nn.Embedding(n_ctx, n_state)
+
+        self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
+            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
+        )
+        self.avg_pooler = nn.AvgPool1d(2, stride=2)
+        self.after_norm = nn.LayerNorm(n_state)
+
+    def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: mel spectrogram, shape (batch_size, n_mels, T)
+            x_len: length of each audio, shape (batch_size,)
+
+        Returns:
+            x: encoded features, shape (batch_size, T//4, n_state)
+            x_len: updated lengths, shape (batch_size,)
+        """
+        T = x.size(-1)
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
+        x = x.permute(0, 2, 1)  # (B, T // 2, n_state)
+
+        # Create attention mask
+        mask = make_non_pad_mask(x_len, T).unsqueeze(1)  # (B, 1, T)
+        mask = mask_to_bias(mask[:, :, (T + 1) % 2 :: 2], x.dtype)  # (B, 1, T // 2)
+
+        # Add positional embedding
+        x = (x + self.positional_embedding.weight[: x.shape[1], :]).to(x.dtype).contiguous()
+
+        # Apply attention blocks
+        for block in self.blocks:
+            x = block(x, mask.unsqueeze(1))
+
+        # Pool and normalize
+        x = x.permute(0, 2, 1)
+        x = self.avg_pooler(x)
+        x = x.permute(0, 2, 1)
+        x_len = (x_len + 1) // 2 // 2
+        x = self.after_norm(x)
+
+        return x, x_len
+
+
+class Adaptor(nn.Module):
+    """
+    Adaptor to project audio features to LLM dimension
+
+    Maps from n_state (512) to n_hidden (LLM dimension, e.g., 4096)
+    with optional downsampling via convolution
+    """
+
+    def __init__(
+        self, n_state: int = 512, n_hidden: int = 4096, kernel_size: int = 3, stride: int = 2, adapter_state: int = 2048
+    ):
+        super().__init__()
+        self.stride = stride
+
+        if self.stride != -1:
+            self.conv = nn.Conv1d(n_state, n_state, kernel_size, stride, padding=1)
+
+        self.linear1 = nn.Linear(n_state, adapter_state)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(adapter_state, n_hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: audio features, shape (batch_size, T, n_state)
+
+        Returns:
+            x: projected features, shape (batch_size, T//stride, n_hidden)
+        """
+        if self.stride != -1:
+            x = x.permute(0, 2, 1)  # (B, n_state, T)
+            x = F.gelu(self.conv(x))
+            x = x.permute(0, 2, 1)  # (B, T//stride, n_state)
+
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+
+        return x
+
+
+# ============================================================================
+# Feature Length Calculation Utility
+# ============================================================================
+
+
+def calculate_audio_feature_length(mel_length: int) -> int:
+    """
+    Calculate output feature length after encoder + adapter processing.
+
+    Processing chain:
+    1. Mel spectrogram input: length = mel_length
+    2. Encoder (AudioEncoder):
+       - conv1: kernel=3, padding=1, stride=1 → no change
+       - conv2: kernel=3, padding=1, stride=2 → T // 2
+       - avg_pool: kernel=2, stride=2 → T // 4
+       - Output length: (mel_length + 1) // 2 // 2 ≈ mel_length // 4
+    3. Adapter (Adaptor):
+       - conv: kernel=3, padding=1, stride=2 → T // 2
+       - Output length: (encoder_output - 1) // 2 + 1
+
+    Args:
+        mel_length: Length of mel spectrogram (time steps)
+
+    Returns:
+        Final feature length after encoder + adapter
+
+    Example:
+        >>> calculate_audio_feature_length(1000)
+        125
+        >>> # Encoder: (1000 + 1) // 4 = 250
+        >>> # Adapter: (250 - 1) // 2 + 1 = 125
+    """
+    # Encoder output length: (mel_length + 1) // 2 // 2
+    # This is mathematically equivalent to: (mel_length + 1) // 4
+    encoder_output_len = (mel_length + 1) // 4
+
+    # Adapter output length: (encoder_len - 1) // 2 + 1
+    adapter_output_len = (encoder_output_len - 1) // 2 + 1
+
+    # Ensure at least 1 token
+    return max(1, adapter_output_len)
+
+
+# ============================================================================
+# Multi-Modal Processing
+# ============================================================================
+
+
+class StepAudio2Processor(ProcessorMixin):
+    """Processor for Step-Audio2 that handles text tokenization and audio mel-spectrograms."""
+
+    attributes = ["tokenizer"]
+    # Bypass dynamic module resolution
+    attribute_class = {"tokenizer": "PreTrainedTokenizerBase"}
+
+    def __init__(self, tokenizer):
+        # Set tokenizer directly to avoid ProcessorMixin validation
+        self.tokenizer = tokenizer
+        # Define audio token string (used by PromptReplacement target matching)
+        self.audio_token = "<audio_patch>"
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        """Process text and audio inputs."""
+        if text is None:
+            text = ""
+
+        # Filter tokenizer kwargs
+        allowed = {
+            "padding",
+            "truncation",
+            "max_length",
+            "return_tensors",
+            "add_special_tokens",
+            "pad_to_multiple_of",
+            "stride",
+            "return_attention_mask",
+            "return_token_type_ids",
+            "return_overflowing_tokens",
+            "return_offsets_mapping",
+            "return_special_tokens_mask",
+            "verbose",
+            "is_split_into_words",
+        }
+        tok_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+        if "return_tensors" not in tok_kwargs:
+            tok_kwargs["return_tensors"] = "pt"
+
+        # Tokenize text
+        encoded = self.tokenizer(text, **tok_kwargs)
+
+        # Handle audio
+        if audio is None:
+            # Return empty audio fields
+            encoded["audio_mels"] = torch.empty((0, 128, 0))
+            encoded["audio_lens"] = torch.tensor([], dtype=torch.int32)
+            return encoded
+
+        # Convert audio to list
+        audio_list = list(audio) if isinstance(audio, (list, tuple)) else [audio]
+
+        # Convert to mel-spectrograms
+        mels = [log_mel_spectrogram(a) for a in audio_list]
+        audio_mels, audio_lens = padding_mels(mels)
+
+        encoded["audio_mels"] = audio_mels
+        encoded["audio_lens"] = audio_lens
+        return encoded
+
+
+class StepAudio2AudioInputs(TypedDict):
     """Audio inputs for Step-Audio2"""
+
     audio_mels: torch.Tensor
-    """Shape: (num_audios * num_frames, num_mel_bins)"""
+    """Shape: (batch, num_mel_bins, time_steps)"""
 
     audio_lens: list[int]
-    """Shape: (num_audios,)"""
+    """Shape: (batch,) - length of each audio in time steps"""
 
 
 class StepAudio2ProcessingInfo(BaseProcessingInfo):
     """Processing info for Step-Audio2"""
 
-    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+    def get_tokenizer(self, **kwargs):
+        # Use AutoTokenizer with mistral regex fix to avoid tokenizer init issues
+        return AutoTokenizer.from_pretrained(
+            self.ctx.model_config.model,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+            **kwargs,
+        )
+
+    def get_hf_processor(self, **kwargs: object):
+        # Always return our custom ProcessorMixin to bypass AutoProcessor
+        return StepAudio2Processor(self.get_tokenizer())
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None}
 
     def get_mm_max_tokens_per_item(
@@ -90,9 +479,7 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
         # 25s audio at 16kHz
         audio_len = 16000 * 25
         num_audios = mm_counts.get("audio", 0)
-        return {
-            "audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)
-        }
+        return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)}
 
 
 class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2ProcessingInfo]):
@@ -106,10 +493,27 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_inputs,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
+        """Map processor outputs to vLLM multimodal fields.
+
+        audio_mels is a padded 3D tensor per audio item with matching audio_lens.
+        Use flat_from_sizes to keep one mm item per audio, so downstream mm_kwargs
+        alignment does not collapse to a single item.
+        """
         audio_lens = hf_inputs.get("audio_lens", torch.empty(0))
+        # Ensure a 1D tensor for flat_from_sizes
+        if isinstance(audio_lens, torch.Tensor):
+            lens_tensor = audio_lens.flatten()
+        elif audio_lens is None:
+            lens_tensor = torch.empty(0, dtype=torch.int32)
+        else:
+            lens_tensor = torch.tensor(
+                list(audio_lens) if hasattr(audio_lens, "__iter__") else [int(audio_lens)], dtype=torch.int32
+            )
 
         return dict(
-            audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", audio_lens),
+            # audio_mels: [batch, n_mels, padded_time] with per-item lengths
+            audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
+            # audio_lens: [batch] - actual lengths before padding
             audio_lens=MultiModalFieldConfig.batched("audio"),
         )
 
@@ -119,30 +523,129 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
+        # Get processor (following Qwen2.5 Omni pattern)
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+
+        # Get audio token string from processor (consistent with Qwen2.5 Omni)
+        audio_token = getattr(processor, "audio_token", "<audio_patch>")
+
+        # Get actual number of audio items from mm_items (this is the ground truth)
+        audio_items = mm_items.get("audio", [])
+        num_audio_items = len(audio_items) if audio_items else 0
+
+        # Get multimodal data from kwargs
+        out_mm_data = out_mm_kwargs.get_data()
+        audio_lens = out_mm_data.get("audio_lens")
+
         # Calculate actual audio feature lengths from audio_lens
-        audio_lens = out_mm_kwargs.get("audio_lens", [])
-        if audio_lens is not None and hasattr(audio_lens, '__iter__'):
+        feature_lens = []
+        if audio_lens is not None:
             # Convert to list if tensor
             if isinstance(audio_lens, torch.Tensor):
-                audio_lens = flatten_bn(audio_lens, concat=True).tolist()
-            # Calculate feature lengths: (audio_len - 1) // 8 + 1 (after encoder + adapter)
-            feature_lens = [max(1, (length - 1) // 8 + 1) for length in audio_lens]
-        else:
-            # Fallback to conservative estimate
-            feature_lens = [250]  # max_audio_tokens from get_mm_max_tokens_per_item
+                audio_lens_list = audio_lens.tolist()
+            else:
+                audio_lens_list = list(audio_lens) if hasattr(audio_lens, "__iter__") else [audio_lens]
+
+            # Calculate feature lengths using helper function
+            # See calculate_audio_feature_length() for detailed explanation
+            for length in audio_lens_list:
+                if length > 0:
+                    feature_len = calculate_audio_feature_length(int(length))
+                    feature_lens.append(feature_len)
+
+        # CRITICAL: Align feature_lens with mm_items['audio'] count
+        # If feature_lens is shorter, pad with default value
+        # If feature_lens is longer, truncate to match
+        if num_audio_items > 0:
+            if len(feature_lens) < num_audio_items:
+                # Pad with default feature length
+                default_feature_len = 250  # max_audio_tokens
+                pad_count = num_audio_items - len(feature_lens)
+                feature_lens.extend([default_feature_len] * pad_count)
+            elif len(feature_lens) > num_audio_items:
+                # Truncate to match
+                feature_lens = feature_lens[:num_audio_items]
+        elif not feature_lens:
+            # No audio items and no feature_lens, use default
+            feature_lens = [250]
+
+        # Create replacement function (returns list of token IDs)
+        def get_replacement_audio(item_idx: int):
+            """Generate replacement tokens for audio placeholder.
+
+            Following Qwen2.5-Omni pattern: returns list[int] of token IDs.
+            """
+            # Fallback: if item_idx is out of bounds, use minimum replacement (1 token)
+            if item_idx >= len(feature_lens):
+                num_features = 1  # Minimum replacement
+            else:
+                num_features = feature_lens[item_idx]
+
+            # Return list of token IDs (same as Qwen2.5-Omni pattern)
+            return [STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID] * num_features
 
         return [
             PromptReplacement(
                 modality="audio",
-                target=[AUDIO_PATCH_TOKEN_ID],
-                replacement=lambda item_idx: PromptUpdateDetails.select_token_id(
-                    seq=[AUDIO_PATCH_TOKEN_ID] * feature_lens[item_idx],
-                    embed_token_id=AUDIO_PATCH_TOKEN_ID,
-                ),
+                target=audio_token,  # Use audio_token from processor (consistent with Qwen2.5 Omni)
+                replacement=get_replacement_audio,
             )
         ]
 
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object] | None = None,
+        tok_kwargs: Mapping[str, object] | None = None,
+        **_: object,
+    ):
+        """Call HF processor and post-process outputs"""
+        mm_data = dict(mm_data)
+        audios = mm_data.pop("audios", [])
 
+        mm_kwargs = mm_kwargs or {}
+        tok_kwargs = tok_kwargs or {}
+
+        # Convert audios key for our processor
+        # CRITICAL: Ensure audios is ALWAYS a list to prevent string iteration
+        if audios:
+            # If audios is a string (file path), wrap it in a list
+            if isinstance(audios, str):
+                mm_data["audio"] = [audios]
+            elif isinstance(audios, (list, tuple)):
+                mm_data["audio"] = audios
+            else:
+                # Single non-string item - wrap in list to be safe
+                mm_data["audio"] = [audios]
+
+        # Call parent's processor (handles tokenization AND audio processing)
+        hf_inputs = super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
+
+        # Ensure audio fields always exist (even if empty)
+        if "audio_mels" not in hf_inputs:
+            hf_inputs["audio_mels"] = torch.empty((0, 128, 0))
+        if "audio_lens" not in hf_inputs:
+            hf_inputs["audio_lens"] = torch.tensor([], dtype=torch.int32)
+
+        return hf_inputs
+
+
+# ============================================================================
+# Main Thinker Model
+# ============================================================================
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    StepAudio2MultiModalProcessor,
+    info=StepAudio2ProcessingInfo,
+    dummy_inputs=StepAudio2DummyInputsBuilder,
+)
 class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     """
     Step-Audio2 Thinker - Stage 1 LLM
@@ -155,6 +658,8 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Mark that this model has multimodal outputs (required by vLLM-Omni framework)
+        self.have_multimodal_outputs = True
 
         config = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -162,61 +667,90 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self.config = config
         self.multimodal_config = multimodal_config
 
-        # Get encoder config
-        if hasattr(config, 'audio_encoder_config'):
-            encoder_config = config.audio_encoder_config
-        else:
-            # Default config
-            class DefaultEncoderConfig:
-                n_mels = 128
-                n_audio_ctx = 1500
-                n_audio_state = 512
-                n_audio_head = 8
-                n_audio_layer = 6
-                llm_dim = config.hidden_size if hasattr(config, 'hidden_size') else 4096
-                kernel_size = 3
-                adapter_stride = 2
-            encoder_config = DefaultEncoderConfig()
+        # Read encoder configuration from model's audio_encoder_config
+        # This is defined in the model's config.json
+        audio_enc_cfg = getattr(config, "audio_encoder_config", {})
+
+        # Helper function to get value from config object or dict
+        def _get_config_value(cfg, attr_name: str, default_value):
+            """Get value from config object or dict"""
+            if isinstance(cfg, dict):
+                return cfg.get(attr_name, default_value)
+            else:
+                return getattr(cfg, attr_name, default_value)
+
+        # Get configuration values from config or use defaults from constants
+        n_mels = _get_config_value(audio_enc_cfg, "n_mels", DEFAULT_MODEL_CONFIG.n_mels)
+        n_audio_ctx = _get_config_value(audio_enc_cfg, "n_audio_ctx", DEFAULT_MODEL_CONFIG.n_audio_ctx)
+        n_audio_state = _get_config_value(audio_enc_cfg, "n_audio_state", DEFAULT_MODEL_CONFIG.n_audio_state)
+        n_audio_head = _get_config_value(audio_enc_cfg, "n_audio_head", DEFAULT_MODEL_CONFIG.n_audio_head)
+        n_audio_layer = _get_config_value(audio_enc_cfg, "n_audio_layer", DEFAULT_MODEL_CONFIG.n_audio_layer)
+        kernel_size = _get_config_value(audio_enc_cfg, "kernel_size", DEFAULT_MODEL_CONFIG.kernel_size)
+        adapter_stride = _get_config_value(audio_enc_cfg, "adapter_stride", DEFAULT_MODEL_CONFIG.adapter_stride)
+
+        # Get LLM hidden size from config with multiple fallback options
+        # Priority: audio_encoder_config.llm_dim > text_config.hidden_size > config.hidden_size > default
+        n_hidden = None
+
+        # Try audio_encoder_config.llm_dim first (Step-Audio2 specific)
+        if audio_enc_cfg:
+            n_hidden = _get_config_value(audio_enc_cfg, "llm_dim", None)
+
+        # Try text_config.hidden_size (nested config structure)
+        if n_hidden is None:
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None:
+                n_hidden = _get_config_value(text_config, "hidden_size", None)
+
+        # Try top-level hidden_size
+        if n_hidden is None:
+            n_hidden = _get_config_value(config, "hidden_size", None)
+
+        # Use default as last resort
+        if n_hidden is None:
+            n_hidden = DEFAULT_MODEL_CONFIG.hidden_size
 
         # Initialize audio encoder
         self.encoder = AudioEncoder(
-            n_mels=encoder_config.n_mels,
-            n_ctx=encoder_config.n_audio_ctx,
-            n_state=encoder_config.n_audio_state,
-            n_head=encoder_config.n_audio_head,
-            n_layer=encoder_config.n_audio_layer,
+            n_mels=n_mels,
+            n_ctx=n_audio_ctx,
+            n_state=n_audio_state,
+            n_head=n_audio_head,
+            n_layer=n_audio_layer,
         )
 
         # Initialize adapter
         self.adapter = Adaptor(
-            n_state=encoder_config.n_audio_state,
-            n_hidden=encoder_config.llm_dim,
-            kernel_size=encoder_config.kernel_size,
-            stride=encoder_config.adapter_stride,
+            n_state=n_audio_state,
+            n_hidden=n_hidden,  # LLM hidden size from config
+            kernel_size=kernel_size,
+            stride=adapter_stride,
         )
 
-        # Initialize language model (Qwen2)
-        # Use text_config if available, otherwise use main config
-        text_config = getattr(config, 'text_config', config)
+        # Initialize language model (prefer text_config if provided by HF)
+        from transformers import PretrainedConfig
+
+        text_config = getattr(config, "text_config", None)
+        lm_config = text_config if isinstance(text_config, PretrainedConfig) else config
+        architectures = getattr(lm_config, "architectures", None) or getattr(config, "architectures", None)
+        if not architectures:
+            model_type = getattr(lm_config, "model_type", None) or getattr(config, "model_type", None)
+            model_type_to_arch = {
+                "qwen2": "Qwen2ForCausalLM",
+                "qwen2_5": "Qwen2_5ForCausalLM",
+            }
+            arch = model_type_to_arch.get(model_type)
+            architectures = [arch] if arch else ["Qwen2ForCausalLM"]
+        # Create a new vllm_config with explicit architecture for the LLM
+        lm_vllm_config = vllm_config.with_hf_config(lm_config, architectures=architectures)
         self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=text_config,
-            prefix=maybe_prefix(prefix, "language_model")
+            vllm_config=lm_vllm_config, hf_config=lm_config, prefix=maybe_prefix(prefix, "language_model")
         )
 
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors
-        )
-
-        logger.info(
-            f"Initialized Step-Audio2 Thinker with encoder: "
-            f"{encoder_config.n_audio_layer} layers, "
-            f"{encoder_config.n_audio_state} hidden, "
-            f"{encoder_config.llm_dim} LLM dim"
-        )
+        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
             return "<audio_patch>"
         raise ValueError("Only audio modality is supported")
@@ -229,9 +763,7 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def _parse_and_validate_audio_input(
-        self, **kwargs: object
-    ) -> Optional[Step1fAudioInputs]:
+    def _parse_and_validate_audio_input(self, **kwargs: object) -> StepAudio2AudioInputs | None:
         """Parse audio inputs from kwargs"""
         audio_mels = kwargs.get("audio_mels", None)
         audio_lens = kwargs.get("audio_lens", None)
@@ -241,37 +773,33 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         # Flatten batch dimensions
         audio_mels = flatten_bn(audio_mels, concat=True)
-        audio_lens = flatten_bn(audio_lens, concat=True).tolist()
+        audio_lens = flatten_bn(audio_lens, concat=True)
 
-        # Split into list based on lengths
-        audio_mels_lst = []
-        cur_idx = 0
-        for audio_len in audio_lens:
-            audio_mels_lst.append(audio_mels[cur_idx:cur_idx + audio_len])
-            cur_idx += audio_len
+        # Validate n_mels dimension (should be 128)
+        expected_n_mels = 128
+        if audio_mels.ndim == 3 and audio_mels.size(1) != expected_n_mels:
+            # For profiling compatibility, return None to skip this batch
+            return None
 
-        # Pad to same length
-        max_len = max(x.size(0) for x in audio_mels_lst)
-        audio_mels = torch.stack(
-            [F.pad(x, (0, 0, 0, max_len - x.size(0))) for x in audio_mels_lst],
-            dim=0
-        )
+        # audio_mels is already in correct format [batch, n_mels, time]
+        # audio_lens contains the actual audio length for each item (used by encoder to ignore padding)
+        # No need to split and restack!
 
-        return Step1fAudioInputs(
+        return StepAudio2AudioInputs(
             audio_mels=audio_mels.to(self.dtype).to(self.device),
             audio_lens=audio_lens,
         )
 
-    def _process_audio_input(
-        self, audio_input: Step1fAudioInputs
-    ) -> tuple[torch.Tensor, ...]:
+    def _process_audio_input(self, audio_input: StepAudio2AudioInputs) -> tuple[torch.Tensor, ...]:
         """Process audio mels through encoder and adapter"""
         audio_mels = audio_input["audio_mels"]
-        audio_lens = torch.tensor(audio_input["audio_lens"], device=self.device)
+        audio_lens = audio_input["audio_lens"]
+        if not isinstance(audio_lens, torch.Tensor):
+            audio_lens = torch.tensor(audio_lens, device=self.device)
+        else:
+            audio_lens = audio_lens.to(self.device)
 
-        # Permute to (B, n_mels, T)
-        audio_mels = audio_mels.permute(0, 2, 1)
-
+        # audio_mels is already in correct format (B, n_mels, T) for Conv1d encoder
         # Encode audio
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)
 
@@ -282,14 +810,11 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_feature_lens = (audio_lens - 1) // 2 + 1
 
         # Split into list
-        audio_feature_list = [
-            audio_features[i, :audio_feature_lens[i]]
-            for i in range(audio_features.size(0))
-        ]
+        audio_feature_list = [audio_features[i, : audio_feature_lens[i]] for i in range(audio_features.size(0))]
 
         return audio_feature_list
 
-    def get_multimodal_embeddings(self, **kwargs) -> Optional[NestedTensors]:
+    def get_multimodal_embeddings(self, **kwargs) -> NestedTensors | None:
         """Get multimodal embeddings"""
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
@@ -301,16 +826,13 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[NestedTensors] = None,
+        multimodal_embeddings: NestedTensors | None = None,
     ) -> torch.Tensor:
         """Get input embeddings with multimodal fusion"""
         inputs_embeds = self.language_model.model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                multimodal_embeddings,
-                AUDIO_PATCH_TOKEN_ID
+                input_ids, inputs_embeds, multimodal_embeddings, STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID
             )
         return inputs_embeds
 
@@ -321,8 +843,8 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
         """Forward pass - returns OmniOutput for multi-stage pipeline"""
@@ -341,10 +863,9 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         )
 
         # Return OmniOutput for multi-stage compatibility
-        # Audio tokens will be extracted from generated token_ids by the input processor
         return OmniOutput(
             text_hidden_states=hidden_states,
-            multimodal_outputs={},  # Empty for now, audio tokens extracted later
+            multimodal_outputs={},
         )
 
     def compute_logits(
@@ -377,20 +898,17 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     @staticmethod
     def separate_tokens(
-        token_ids: List[int],
-        text_max: int = STEP_AUDIO2_TEXT_MAX,
-        audio_start: int = STEP_AUDIO2_AUDIO_START
-    ) -> Tuple[List[int], List[int]]:
+        token_ids: list[int],
+        text_max: int = DEFAULT_TOKEN_CONFIG.text_max,
+        audio_start: int = DEFAULT_TOKEN_CONFIG.audio_start,
+    ) -> tuple[list[int], list[int]]:
         """Separate generated tokens into text and audio tokens"""
         text_tokens = [tid for tid in token_ids if tid < text_max]
         audio_tokens = [tid - audio_start for tid in token_ids if tid >= audio_start]
         return text_tokens, audio_tokens
 
     @staticmethod
-    def has_audio_output(
-        token_ids: List[int],
-        audio_start: int = STEP_AUDIO2_AUDIO_START
-    ) -> bool:
+    def has_audio_output(token_ids: list[int], audio_start: int = DEFAULT_TOKEN_CONFIG.audio_start) -> bool:
         """Check if generated tokens contain audio tokens"""
         return any(tid >= audio_start for tid in token_ids)
 
@@ -399,31 +917,25 @@ class StepAudio2OutputProcessor:
     """Helper class to process Step-Audio2 outputs"""
 
     @staticmethod
-    def process_output(
-        output_ids: torch.Tensor,
-        tokenizer,
-        remove_audio_padding: bool = True
-    ) -> dict:
+    def process_output(output_ids: torch.Tensor, tokenizer, remove_audio_padding: bool = True) -> dict:
         """Process model output and separate text/audio tokens"""
         if isinstance(output_ids, torch.Tensor):
             output_ids = output_ids.squeeze().tolist()
 
         # Separate tokens
-        text_tokens, audio_tokens = StepAudio2ThinkerForConditionalGeneration.separate_tokens(
-            output_ids
-        )
+        text_tokens, audio_tokens = StepAudio2ThinkerForConditionalGeneration.separate_tokens(output_ids)
 
         # Remove audio padding if requested
         if remove_audio_padding and audio_tokens:
-            audio_tokens = [t for t in audio_tokens if t < STEP_AUDIO2_AUDIO_EOS]
+            audio_tokens = [t for t in audio_tokens if t < DEFAULT_TOKEN_CONFIG.audio_eos]
 
         # Decode text
         text = tokenizer.decode(text_tokens, skip_special_tokens=False)
 
         return {
-            'text': text,
-            'text_tokens': text_tokens,
-            'audio_tokens': audio_tokens,
-            'has_audio': len(audio_tokens) > 0,
-            'all_tokens': output_ids
+            "text": text,
+            "text_tokens": text_tokens,
+            "audio_tokens": audio_tokens,
+            "has_audio": len(audio_tokens) > 0,
+            "all_tokens": output_ids,
         }
