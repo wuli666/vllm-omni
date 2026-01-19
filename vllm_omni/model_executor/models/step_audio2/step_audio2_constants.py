@@ -76,6 +76,20 @@ class StepAudio2EncoderConfig:
 
 
 @dataclass(frozen=True)
+class StepAudio2Token2WavConfig:
+    """Token2Wav synthesis configuration."""
+
+    n_timesteps: int = 10
+    """Number of diffusion timesteps for flow model inference"""
+
+    mel_cache_len: int = 8
+    """Mel cache length for streaming (160ms at 50Hz)"""
+
+    sample_rate: int = 24000
+    """Output audio sample rate"""
+
+
+@dataclass(frozen=True)
 class StepAudio2ModelConfig:
     """
     Step-Audio2 complete model configuration - Single Source of Truth.
@@ -108,6 +122,7 @@ class StepAudio2ModelConfig:
 # Default configuration instances
 DEFAULT_TOKEN_CONFIG = StepAudio2TokenConfig()
 DEFAULT_ENCODER_CONFIG = StepAudio2EncoderConfig()
+DEFAULT_TOKEN2WAV_CONFIG = StepAudio2Token2WavConfig()
 DEFAULT_MODEL_CONFIG = StepAudio2ModelConfig()
 
 # Export constants for backward compatibility
@@ -125,9 +140,11 @@ STEP_AUDIO2_DEFAULT_PROMPT_WAV = "default_female.wav"
 __all__ = [
     "StepAudio2TokenConfig",
     "StepAudio2EncoderConfig",
+    "StepAudio2Token2WavConfig",
     "StepAudio2ModelConfig",
     "DEFAULT_TOKEN_CONFIG",
     "DEFAULT_ENCODER_CONFIG",
+    "DEFAULT_TOKEN2WAV_CONFIG",
     "DEFAULT_MODEL_CONFIG",
     "STEP_AUDIO2_TEXT_MAX",
     "STEP_AUDIO2_AUDIO_START",

@@ -102,49 +102,45 @@ python end2end.py --query-type audio_to_text \
 
 ### 2. Text to Audio (TTS - Speech Synthesis)
 
-Convert text to speech with a speaker prompt:
+Convert text to speech:
 
 ```bash
 # Basic TTS (model auto-downloads)
 python end2end.py --query-type text_to_audio \
-    --text "Hello, this is a test of Step Audio 2 synthesis." \
-    --prompt-wav /path/to/speaker_sample.wav
+    --text "Hello, this is a test of Step Audio 2 synthesis."
 
 # With specific model
 python end2end.py --query-type text_to_audio \
     --text "Hello, this is a test." \
-    --prompt-wav speaker.wav \
     --model stepfun-ai/Step-Audio2-7B
 ```
 
-**Important**: `--prompt-wav` is **REQUIRED** for TTS. This audio file determines the voice characteristics (speaker identity, tone, style) of the generated speech.
+**Note**: Speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable or the default prompt wav bundled with the model.
 
 **Output**:
 - Text: `output_step_audio2/00000_text.txt`
 - Audio: `output_step_audio2/00000_output.wav` (24kHz)
 
-### 3. Audio to Audio (Voice Conversion / Cloning)
+### 3. Audio to Audio (Voice Conversion)
 
-Transform input audio to match a target speaker's voice:
+Process input audio and generate output audio:
 
 ```bash
 # Basic voice conversion (model auto-downloads)
 python end2end.py --query-type audio_to_audio \
-    --audio-path /path/to/source_audio.wav \
-    --prompt-wav /path/to/target_speaker.wav
+    --audio-path /path/to/source_audio.wav
 
 # With specific model
 python end2end.py --query-type audio_to_audio \
     --audio-path source.wav \
-    --prompt-wav target_speaker.wav \
     --model stepfun-ai/Step-Audio2-7B
 ```
 
 This mode:
 1. Understands the content in `--audio-path` (source)
-2. Generates audio output with the voice style from `--prompt-wav` (target speaker)
+2. Generates audio output with the default voice
 
-**Use cases**: Voice cloning, accent transfer, speaker adaptation
+**Note**: To use a custom speaker voice, set the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable.
 
 ### Advanced Options
 
@@ -161,7 +157,6 @@ python end2end.py --query-type audio_to_text \
 # Custom output directory
 python end2end.py --query-type text_to_audio \
     --text "Test synthesis" \
-    --prompt-wav speaker.wav \
     --output-dir ./my_outputs
 
 # Enable detailed logging
@@ -174,10 +169,14 @@ python end2end.py --query-type audio_to_text \
     --audio-path input.wav \
     --max-tokens 2048
 
+# Use custom speaker voice via environment variable
+STEP_AUDIO2_DEFAULT_PROMPT_WAV=/path/to/speaker.wav python end2end.py \
+    --query-type text_to_audio \
+    --text "Hello world"
+
 # Use Ray backend for distributed processing
 python end2end.py --query-type text_to_audio \
     --text "Hello world" \
-    --prompt-wav speaker.wav \
     --worker-backend ray \
     --ray-address "auto"
 ```
@@ -213,14 +212,14 @@ For **single GPU** setup, edit the config to use `devices: "0"` for both stages.
 pip install step-audio2
 ```
 
-### 2. ValueError: "prompt_wav is required for Token2Wav"
+### 2. FileNotFoundError: prompt_wav file not found
 
-**Solution**: For `text_to_audio` and `audio_to_audio` modes, you **must** provide `--prompt-wav`:
+**Solution**: Set the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable to a valid audio file:
 ```bash
-python end2end.py --query-type text_to_audio \
-    --text "Hello" \
-    --prompt-wav speaker_sample.wav
+export STEP_AUDIO2_DEFAULT_PROMPT_WAV=/path/to/speaker.wav
+python end2end.py --query-type text_to_audio --text "Hello"
 ```
+Or ensure the default prompt wav (`default_female.wav`) exists in your model directory.
 
 ### 3. FileNotFoundError: token2wav models not found
 
@@ -261,9 +260,11 @@ output_step_audio2/
 4. **Ray backend**: For multi-node or advanced scheduling
 5. **Logging**: Use `--enable-stats` to debug performance issues
 
-## Speaker Prompt Guidelines
+## Speaker Voice Configuration
 
-For best results with `--prompt-wav`:
+The output speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable.
+
+**Guidelines for custom speaker prompt:**
 
 - **Duration**: 3-10 seconds recommended
 - **Quality**: Clean audio, minimal background noise
@@ -284,10 +285,10 @@ python end2end.py --query-type audio_to_text \
 # 2. Check the transcription
 cat ./outputs/00000_text.txt
 
-# 3. TTS: Synthesize new speech with custom voice
+# 3. TTS: Synthesize new speech (with custom voice)
+STEP_AUDIO2_DEFAULT_PROMPT_WAV=./speaker_samples/female_voice.wav \
 python end2end.py --query-type text_to_audio \
     --text "The quick brown fox jumps over the lazy dog" \
-    --prompt-wav ./speaker_samples/female_voice.wav \
     --model ./models/Step-Audio2-7B \
     --output-dir ./outputs
 
@@ -297,6 +298,6 @@ python end2end.py --query-type text_to_audio \
 
 ## References
 
-- [Step-Audio2 Paper](https://arxiv.org/abs/...)
+- [Step-Audio2 Paper](https://arxiv.org/abs/2507.16632)
 - [vLLM-Omni Documentation](https://vllm-omni.readthedocs.io)
-- [Model on HuggingFace](https://huggingface.co/stepfun-ai/Step-Audio2-7B)
+- [Model on HuggingFace](https://huggingface.co/stepfun-ai/Step-Audio-2-mini)

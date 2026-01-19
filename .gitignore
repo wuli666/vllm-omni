@@ -156,6 +156,9 @@ cython_debug/
 # cursor
 .cursor/
 
+# claude
+.claude/
+
 # scripts
 /scripts/
 

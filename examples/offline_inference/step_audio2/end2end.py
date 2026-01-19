@@ -91,7 +91,6 @@ def get_audio_to_text_query(
 
 def get_text_to_audio_query(
     text: Optional[str] = None,
-    prompt_wav: Optional[str] = None,
     sampling_rate: int = 16000,
 ) -> QueryResult:
     """
@@ -99,7 +98,6 @@ def get_text_to_audio_query(
 
     Args:
         text: Text to synthesize
-        prompt_wav: Optional speaker prompt audio file (unused in default-voice mode)
         sampling_rate: Target sampling rate (16kHz for Step-Audio2)
 
     Returns:
@@ -133,7 +131,6 @@ def get_text_to_audio_query(
 
 def get_audio_to_audio_query(
     audio_path: Optional[str] = None,
-    prompt_wav: Optional[str] = None,
     question: Optional[str] = None,
     sampling_rate: int = 16000,
 ) -> QueryResult:
@@ -142,16 +139,15 @@ def get_audio_to_audio_query(
 
     Args:
         audio_path: Path to source audio file
-        prompt_wav: Optional speaker prompt audio (unused in default-voice mode)
         question: Question/instruction about the audio
         sampling_rate: Target sampling rate (16kHz for Step-Audio2)
 
     Returns:
-        QueryResult with audio input and speaker prompt
+        QueryResult with audio input
 
     Note:
-        This mode processes input audio and generates output audio
-        using the default voice configuration.
+        This mode processes input audio and generates output audio.
+        Speaker voice is controlled by STEP_AUDIO2_DEFAULT_PROMPT_WAV env var.
     """
     if question is None:
         question = "请仔细聆听这段语音，然后复述其内容。"
@@ -178,8 +174,6 @@ def get_audio_to_audio_query(
             audio_signal = librosa.resample(audio_data[0], orig_sr=audio_data[1], target_sr=sampling_rate)
             audio_data = (audio_signal.astype(np.float32), sampling_rate)
 
-    print("=" * 60 + "\n")
-
     return QueryResult(
         inputs={
             "prompt": prompt,
@@ -199,42 +193,47 @@ query_map = {
 
 
 def main(args):
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logger = logging.getLogger(__name__)
+
     # Use local model path or HuggingFace model name
     if not args.model:
-        print("[Error] 必须指定模型路径！")
-        print("\n使用方法:")
-        print("  本地模型: --model /path/to/your/step-audio-2")
-        print("  HuggingFace: --model stepfun-ai/Step-Audio2-mini")
+        logger.error("Model path is required!")
+        logger.info("Usage:")
+        logger.info("  Local model: --model /path/to/your/step-audio-2")
+        logger.info("  HuggingFace: --model stepfun-ai/Step-Audio2-mini")
         sys.exit(1)
 
     model_name = args.model
 
     # Check if it's a local path
     if os.path.isdir(model_name):
-        print(f"[Info] 使用本地模型: {model_name}")
+        logger.info(f"Using local model: {model_name}")
 
         # Verify essential files exist
         config_path = os.path.join(model_name, "config.json")
         if not os.path.exists(config_path):
-            print(f"[Error] 模型目录缺少 config.json 文件: {config_path}")
-            print("\n请检查目录结构:")
-            print(f"  {model_name}/")
-            print("    ├── config.json        (必需)")
-            print("    ├── model.safetensors 或 pytorch_model.bin")
-            print("    ├── tokenizer.json")
-            print("    └── token2wav/        (Token2Wav 模型)")
+            logger.error(f"Model directory missing config.json: {config_path}")
+            logger.info("Expected directory structure:")
+            logger.info(f"  {model_name}/")
+            logger.info("    ├── config.json        (required)")
+            logger.info("    ├── model.safetensors or pytorch_model.bin")
+            logger.info("    ├── tokenizer.json")
+            logger.info("    └── token2wav/        (Token2Wav models)")
             sys.exit(1)
 
         # Check token2wav directory
         token2wav_path = os.path.join(model_name, "token2wav")
         if not os.path.isdir(token2wav_path):
-            print(f"[Warning] 缺少 token2wav 目录: {token2wav_path}")
-            print("  Stage 1 (Token2Wav) 可能无法正常工作")
+            logger.warning(f"Missing token2wav directory: {token2wav_path}")
+            logger.warning("Stage 1 (Token2Wav) may not work properly")
         else:
-            print("[Info] ✓ Token2Wav 目录存在")
+            logger.info("Token2Wav directory exists")
     else:
-        print(f"[Info] 使用 HuggingFace 模型: {model_name}")
-        print("[Info] 模型将被缓存到 ~/.cache/huggingface/hub/")
+        logger.info(f"Using HuggingFace model: {model_name}")
+        logger.info("Model will be cached in ~/.cache/huggingface/hub/")
 
     # Get query configuration
     query_func = query_map[args.query_type]
@@ -249,13 +248,11 @@ def main(args):
     elif args.query_type == "text_to_audio":
         query_result = query_func(
             text=args.text,
-            prompt_wav=args.prompt_wav,
             sampling_rate=args.sampling_rate,
         )
     elif args.query_type == "audio_to_audio":
         query_result = query_func(
             audio_path=args.audio_path,
-            prompt_wav=args.prompt_wav,
             question=args.question,
             sampling_rate=args.sampling_rate,
         )
@@ -263,8 +260,8 @@ def main(args):
         raise ValueError(f"Unknown query type: {args.query_type}")
 
     # Initialize vLLM-Omni with Step-Audio2
-    print(f"[Info] Initializing Step-Audio2 with model: {model_name}")
-    print(f"[Info] Query type: {args.query_type}")
+    logger.info(f"Initializing Step-Audio2 with model: {model_name}")
+    logger.info(f"Query type: {args.query_type}")
 
     # Resolve stage config path
     if args.stage_configs_path:
@@ -275,7 +272,7 @@ def main(args):
             Path(__file__).parent.parent.parent.parent / "vllm_omni/model_executor/stage_configs/step_audio_2.yaml"
         )
 
-    print(f"[Info] Using stage config: {stage_config_path}")
+    logger.info(f"Using stage config: {stage_config_path}")
 
     omni_llm = Omni(
         model=model_name,
@@ -339,35 +336,31 @@ def main(args):
     else:
         prompts = [query_result.inputs]
 
-    print(f"[Info] Running inference on {len(prompts)} prompt(s)...")
+    logger.info(f"Running inference on {len(prompts)} prompt(s)...")
 
     # Run inference
-    print("[Info] Calling omni_llm.generate()...")
+    logger.info("Calling omni_llm.generate()...")
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
-    print("[Info] Generation completed! Processing outputs...")
+    logger.info("Generation completed! Processing outputs...")
 
     # Create output directory
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # Process outputs from each stage
-    print(f"[Info] Processing {len(omni_outputs)} stage outputs...")
+    logger.info(f"Processing {len(omni_outputs)} stage outputs...")
     for stage_idx, stage_outputs in enumerate(omni_outputs):
-        print(f"[Info] Processing stage {stage_idx}, type: {stage_outputs.final_output_type}")
+        logger.info(f"Processing stage {stage_idx}, type: {stage_outputs.final_output_type}")
         if stage_outputs.final_output_type == "text":
             # Stage 0 (Thinker) text output
-            print("\n" + "=" * 60)
-            print("Stage 0 (Thinker) - Text Output")
-            print("=" * 60)
+            logger.info("=" * 50)
+            logger.info("Stage 0 (Thinker) - Text Output")
 
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
                 text_output = output.outputs[0].text
 
-                # Print to console
-                print(f"\n[Request {request_id}]")
-                print(f"Prompt: {prompts[request_id]['prompt'][:100]}...")
-                print(f"Output: {text_output}")
+                logger.info(f"[Request {request_id}] Output: {text_output[:100]}...")
 
                 # Save to file
                 out_txt = os.path.join(output_dir, f"{request_id:05d}_text.txt")
@@ -375,19 +368,17 @@ def main(args):
                     f.write(f"Prompt:\n{prompts[request_id]['prompt']}\n\n")
                     f.write(f"Output:\n{text_output}\n")
 
-                print(f"[Info] Text saved to {out_txt}")
+                logger.info(f"Text saved to {out_txt}")
 
         elif stage_outputs.final_output_type == "audio":
             # Stage 1 (Token2Wav) audio output
-            print("\n" + "=" * 60)
-            print("Stage 1 (Token2Wav) - Audio Output")
-            print("=" * 60)
+            logger.info("=" * 50)
+            logger.info("Stage 1 (Token2Wav) - Audio Output")
 
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
 
                 # Get audio tensor (24kHz)
-                # Framework normalizes outputs under modality keys (e.g., "audio")
                 mm_out = output.multimodal_output or {}
                 audio_tensor = None
                 for key in ("audio", "wav", "waveform", "audio_pcm", "pcm", "model_outputs"):
@@ -402,16 +393,12 @@ def main(args):
                     sf.write(output_wav, audio_numpy, samplerate=24000)
 
                     duration = len(audio_numpy) / 24000
-                    print(f"\n[Request {request_id}]")
-                    print(f"Audio duration: {duration:.2f}s")
-                    print("Sample rate: 24000 Hz")
-                    print(f"[Info] Audio saved to {output_wav}")
+                    logger.info(f"[Request {request_id}] Audio duration: {duration:.2f}s, saved to {output_wav}")
                 else:
-                    print(f"\n[Request {request_id}] Warning: No audio output generated")
+                    logger.warning(f"[Request {request_id}] No audio output generated")
 
-    print("\n" + "=" * 60)
-    print(f"[Info] All outputs saved to: {output_dir}")
-    print("=" * 60)
+    logger.info("=" * 50)
+    logger.info(f"All outputs saved to: {output_dir}")
 
 
 def parse_args():
@@ -422,15 +409,11 @@ def parse_args():
         "--model",
         "-m",
         type=str,
-        required=True,  # 必需参数
+        required=True,
         help=(
-            "模型路径（必需）。可以是:\n"
-            "  - 本地路径: /path/to/step-audio-2\n"
-            "  - HuggingFace ID: stepfun-ai/Step-Audio2-mini\n"
-            "\n示例:\n"
-            "  --model ./hy-tmp/hub/step-audio-2\n"
-            "  --model /home/user/models/Step-Audio2-7B\n"
-            "  --model stepfun-ai/Step-Audio2-mini"
+            "Model path (required). Can be:\n"
+            "  - Local path: /path/to/step-audio-2\n"
+            "  - HuggingFace ID: stepfun-ai/Step-Audio2-mini"
         ),
     )
     parser.add_argument(
@@ -455,13 +438,6 @@ def parse_args():
         type=str,
         default=None,
         help="Path to input audio file (for audio_to_text and audio_to_audio)",
-    )
-    parser.add_argument(
-        "--prompt-wav",
-        "-p",
-        type=str,
-        default=None,
-        help="Path to speaker prompt audio file (unused in default-voice mode)",
     )
     parser.add_argument(
         "--text",

@@ -177,19 +177,21 @@ class MultiHeadAttention(nn.Module):
         return self.out(wv), qk
 
     def qkv_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None):
-        _, T, D = q.shape
-        scale = (D // self.n_head) ** -0.25
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1) * scale
-        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        B, T, D = q.shape
+        head_dim = D // self.n_head
 
-        qk = q @ k  # (B, n_head, T, T)
-        if mask is not None:
-            qk = qk + mask
-        qk = qk.float()
+        # Reshape: (B, T, D) -> (B, n_head, T, head_dim)
+        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
 
-        w = F.softmax(qk, dim=-1).to(q.dtype)
-        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
+        # Use F.scaled_dot_product_attention
+        # mask is additive bias (0 or -1e10), pass directly as attn_mask
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+        # Reshape back: (B, n_head, T, head_dim) -> (B, T, D)
+        out = out.transpose(1, 2).reshape(B, T, D)
+        return out, None
 
 
 class ResidualAttentionBlock(nn.Module):
