@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage input processor for Step-Audio2: Thinker → Token2Wav transition."""
 
-from typing import Any, Union
+from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
@@ -18,7 +18,7 @@ logger = init_logger(__name__)
 def thinker2token2wav(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: Union[OmniTokensPrompt, TextPrompt, None] = None,
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """
