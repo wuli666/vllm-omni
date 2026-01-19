@@ -24,7 +24,6 @@ Usage examples:
 import base64
 import logging
 import os
-from typing import Optional
 
 import requests
 from openai import OpenAI
@@ -50,7 +49,7 @@ def encode_base64_content_from_url(url: str) -> str:
         return base64.b64encode(response.content).decode("utf-8")
 
 
-def get_audio_url(audio_path: Optional[str] = None) -> str:
+def get_audio_url(audio_path: str | None = None) -> str:
     """Convert audio path to URL format for the API.
 
     Args:
@@ -86,8 +85,8 @@ def get_audio_url(audio_path: Optional[str] = None) -> str:
 
 
 def get_audio_to_text_query(
-    audio_path: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
 ) -> dict:
     """Build query for Audio-to-Text (ASR) mode."""
     question = custom_prompt or "Please transcribe the audio content."
@@ -103,8 +102,8 @@ def get_audio_to_text_query(
 
 
 def get_text_to_audio_query(
-    text: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
+    text: str | None = None,
+    custom_prompt: str | None = None,
 ) -> dict:
     """Build query for Text-to-Audio (TTS) mode."""
     text_to_speak = text or "Hello, this is a test of Step Audio 2 text to speech."
@@ -123,8 +122,8 @@ def get_text_to_audio_query(
 
 
 def get_audio_to_audio_query(
-    audio_path: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
 ) -> dict:
     """Build query for Audio-to-Audio (Voice Conversion) mode."""
     question = custom_prompt or "Please listen to this audio and repeat its content."

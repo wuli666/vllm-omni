@@ -22,7 +22,7 @@ Usage examples:
 import os
 import sys
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import librosa
 import numpy as np
@@ -42,8 +42,8 @@ class QueryResult(NamedTuple):
 
 
 def get_audio_to_text_query(
-    audio_path: Optional[str] = None,
-    question: Optional[str] = None,
+    audio_path: str | None = None,
+    question: str | None = None,
     sampling_rate: int = 16000,
 ) -> QueryResult:
     """
@@ -90,7 +90,7 @@ def get_audio_to_text_query(
 
 
 def get_text_to_audio_query(
-    text: Optional[str] = None,
+    text: str | None = None,
     sampling_rate: int = 16000,
 ) -> QueryResult:
     """
@@ -130,8 +130,8 @@ def get_text_to_audio_query(
 
 
 def get_audio_to_audio_query(
-    audio_path: Optional[str] = None,
-    question: Optional[str] = None,
+    audio_path: str | None = None,
+    question: str | None = None,
     sampling_rate: int = 16000,
 ) -> QueryResult:
     """
