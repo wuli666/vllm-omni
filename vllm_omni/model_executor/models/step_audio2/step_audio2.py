@@ -1,5 +1,3 @@
-from typing import Optional, Union
-
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -95,7 +93,7 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         )
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         """Get placeholder string for a modality
 
         Returns:
@@ -126,8 +124,8 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
         """
@@ -157,8 +155,8 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
     def move_submodules_to_devices(
         self,
         *,
-        thinker_device: Optional[Union[str, torch.device]] = None,
-        token2wav_device: Optional[Union[str, torch.device]] = None,
+        thinker_device: str | torch.device | None = None,
+        token2wav_device: str | torch.device | None = None,
     ) -> None:
         """
         Optionally move thinker/token2wav to different devices
