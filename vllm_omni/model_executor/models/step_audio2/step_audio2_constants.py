@@ -82,9 +82,6 @@ class StepAudio2Token2WavConfig:
     n_timesteps: int = 10
     """Number of diffusion timesteps for flow model inference"""
 
-    mel_cache_len: int = 8
-    """Mel cache length for streaming (160ms at 50Hz)"""
-
     sample_rate: int = 24000
     """Output audio sample rate"""
 

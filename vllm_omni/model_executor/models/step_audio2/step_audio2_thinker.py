@@ -343,36 +343,22 @@ def calculate_audio_feature_length(mel_length: int) -> int:
     Example:
         >>> calculate_audio_feature_length(1000)
         125
-        >>> # Encoder: (1000 + 1) // 4 = 250
-        >>> # Adapter: (250 - 1) // 2 + 1 = 125
     """
-    # Encoder output length: (mel_length + 1) // 2 // 2
-    # This is mathematically equivalent to: (mel_length + 1) // 4
     encoder_output_len = (mel_length + 1) // 4
 
-    # Adapter output length: (encoder_len - 1) // 2 + 1
     adapter_output_len = (encoder_output_len - 1) // 2 + 1
 
-    # Ensure at least 1 token
     return max(1, adapter_output_len)
-
-
-# ============================================================================
-# Multi-Modal Processing
-# ============================================================================
 
 
 class StepAudio2Processor(ProcessorMixin):
     """Processor for Step-Audio2 that handles text tokenization and audio mel-spectrograms."""
 
     attributes = ["tokenizer"]
-    # Bypass dynamic module resolution
     attribute_class = {"tokenizer": "PreTrainedTokenizerBase"}
 
     def __init__(self, tokenizer):
-        # Set tokenizer directly to avoid ProcessorMixin validation
         self.tokenizer = tokenizer
-        # Define audio token string (used by PromptReplacement target matching)
         self.audio_token = "<audio_patch>"
 
     def __call__(self, text=None, audio=None, **kwargs):
@@ -380,7 +366,6 @@ class StepAudio2Processor(ProcessorMixin):
         if text is None:
             text = ""
 
-        # Filter tokenizer kwargs
         allowed = {
             "padding",
             "truncation",
@@ -401,20 +386,15 @@ class StepAudio2Processor(ProcessorMixin):
         if "return_tensors" not in tok_kwargs:
             tok_kwargs["return_tensors"] = "pt"
 
-        # Tokenize text
         encoded = self.tokenizer(text, **tok_kwargs)
 
-        # Handle audio
         if audio is None:
-            # Return empty audio fields
             encoded["audio_mels"] = torch.empty((0, 128, 0))
             encoded["audio_lens"] = torch.tensor([], dtype=torch.int32)
             return encoded
 
-        # Convert audio to list
         audio_list = list(audio) if isinstance(audio, (list, tuple)) else [audio]
 
-        # Convert to mel-spectrograms
         mels = [log_mel_spectrogram(a) for a in audio_list]
         audio_mels, audio_lens = padding_mels(mels)
 
@@ -437,7 +417,6 @@ class StepAudio2ProcessingInfo(BaseProcessingInfo):
     """Processing info for Step-Audio2"""
 
     def get_tokenizer(self, **kwargs):
-        # Use AutoTokenizer with mistral regex fix to avoid tokenizer init issues
         return AutoTokenizer.from_pretrained(
             self.ctx.model_config.model,
             trust_remote_code=True,
@@ -446,7 +425,6 @@ class StepAudio2ProcessingInfo(BaseProcessingInfo):
         )
 
     def get_hf_processor(self, **kwargs: object):
-        # Always return our custom ProcessorMixin to bypass AutoProcessor
         return StepAudio2Processor(self.get_tokenizer())
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
@@ -457,12 +435,7 @@ class StepAudio2ProcessingInfo(BaseProcessingInfo):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        # Audio encoder output length calculation
-        # After conv2 (stride=2): T//2
-        # After avg_pool (stride=2): T//4
-        # After adaptor conv (stride=2): T//8
-        # Approximately: max_feature_len // 8
-        max_audio_tokens = 250  # Conservative estimate for 25s audio
+        max_audio_tokens = 250
         return {"audio": max_audio_tokens}
 
 
@@ -478,7 +451,6 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> MultiModalDataDict:
-        # 25s audio at 16kHz
         audio_len = 16000 * 25
         num_audios = mm_counts.get("audio", 0)
         return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)}
@@ -502,7 +474,6 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         alignment does not collapse to a single item.
         """
         audio_lens = hf_inputs.get("audio_lens", torch.empty(0))
-        # Ensure a 1D tensor for flat_from_sizes
         if isinstance(audio_lens, torch.Tensor):
             lens_tensor = audio_lens.flatten()
         elif audio_lens is None:
@@ -513,9 +484,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             )
 
         return dict(
-            # audio_mels: [batch, n_mels, padded_time] with per-item lengths
             audio_mels=MultiModalFieldConfig.flat_from_sizes("audio", lens_tensor),
-            # audio_lens: [batch] - actual lengths before padding
             audio_lens=MultiModalFieldConfig.batched("audio"),
         )
 
@@ -525,71 +494,55 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
-        # Get processor (following Qwen2.5 Omni pattern)
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
-        # Get audio token string from processor (consistent with Qwen2.5 Omni)
         audio_token = getattr(processor, "audio_token", "<audio_patch>")
 
-        # Get actual number of audio items from mm_items (this is the ground truth)
         audio_items = mm_items.get("audio", [])
         num_audio_items = len(audio_items) if audio_items else 0
 
-        # Get multimodal data from kwargs
         out_mm_data = out_mm_kwargs.get_data()
         audio_lens = out_mm_data.get("audio_lens")
 
-        # Calculate actual audio feature lengths from audio_lens
         feature_lens = []
         if audio_lens is not None:
-            # Convert to list if tensor
             if isinstance(audio_lens, torch.Tensor):
                 audio_lens_list = audio_lens.tolist()
             else:
                 audio_lens_list = list(audio_lens) if hasattr(audio_lens, "__iter__") else [audio_lens]
 
-            # Calculate feature lengths using helper function
-            # See calculate_audio_feature_length() for detailed explanation
             for length in audio_lens_list:
                 if length > 0:
                     feature_len = calculate_audio_feature_length(int(length))
                     feature_lens.append(feature_len)
 
         # CRITICAL: Align feature_lens with mm_items['audio'] count
-        # If feature_lens is shorter, pad with default value
-        # If feature_lens is longer, truncate to match
         if num_audio_items > 0:
             if len(feature_lens) < num_audio_items:
-                # Pad with default feature length
-                default_feature_len = 250  # max_audio_tokens
+                default_feature_len = 250
                 pad_count = num_audio_items - len(feature_lens)
                 feature_lens.extend([default_feature_len] * pad_count)
             elif len(feature_lens) > num_audio_items:
-                # Truncate to match
                 feature_lens = feature_lens[:num_audio_items]
         elif not feature_lens:
-            # No audio items and no feature_lens, use default
             feature_lens = [250]
 
-        # Create replacement function (returns list of token IDs)
         def get_replacement_audio(item_idx: int):
             """Generate replacement tokens for audio placeholder.
 
             Following Qwen2.5-Omni pattern: returns list[int] of token IDs.
             """
-            # Fallback: if item_idx is out of bounds, use minimum replacement (1 token)
             if item_idx >= len(feature_lens):
-                num_features = 1  # Minimum replacement
+                num_features = 1
             else:
                 num_features = feature_lens[item_idx]
 
-            # Return list of token IDs (same as Qwen2.5-Omni pattern)
             return [STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID] * num_features
 
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,  # Use audio_token from processor (consistent with Qwen2.5 Omni)
+                target=audio_token,
                 replacement=get_replacement_audio,
             )
         ]
@@ -609,19 +562,15 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         mm_kwargs = mm_kwargs or {}
         tok_kwargs = tok_kwargs or {}
 
-        # Convert audios key for our processor
         # CRITICAL: Ensure audios is ALWAYS a list to prevent string iteration
         if audios:
-            # If audios is a string (file path), wrap it in a list
             if isinstance(audios, str):
                 mm_data["audio"] = [audios]
             elif isinstance(audios, (list, tuple)):
                 mm_data["audio"] = audios
             else:
-                # Single non-string item - wrap in list to be safe
                 mm_data["audio"] = [audios]
 
-        # Call parent's processor (handles tokenization AND audio processing)
         hf_inputs = super()._call_hf_processor(
             prompt=prompt,
             mm_data=mm_data,
@@ -629,7 +578,6 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             tok_kwargs=tok_kwargs,
         )
 
-        # Ensure audio fields always exist (even if empty)
         if "audio_mels" not in hf_inputs:
             hf_inputs["audio_mels"] = torch.empty((0, 128, 0))
         if "audio_lens" not in hf_inputs:
@@ -660,7 +608,6 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        # Mark that this model has multimodal outputs (required by vLLM-Omni framework)
         self.have_multimodal_outputs = True
 
         config = vllm_config.model_config.hf_config
@@ -669,11 +616,8 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self.config = config
         self.multimodal_config = multimodal_config
 
-        # Read encoder configuration from model's audio_encoder_config
-        # This is defined in the model's config.json
         audio_enc_cfg = getattr(config, "audio_encoder_config", {})
 
-        # Helper function to get value from config object or dict
         def _get_config_value(cfg, attr_name: str, default_value):
             """Get value from config object or dict"""
             if isinstance(cfg, dict):
@@ -681,7 +625,6 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             else:
                 return getattr(cfg, attr_name, default_value)
 
-        # Get configuration values from config or use defaults from constants
         n_mels = _get_config_value(audio_enc_cfg, "n_mels", DEFAULT_MODEL_CONFIG.n_mels)
         n_audio_ctx = _get_config_value(audio_enc_cfg, "n_audio_ctx", DEFAULT_MODEL_CONFIG.n_audio_ctx)
         n_audio_state = _get_config_value(audio_enc_cfg, "n_audio_state", DEFAULT_MODEL_CONFIG.n_audio_state)
@@ -690,29 +633,22 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         kernel_size = _get_config_value(audio_enc_cfg, "kernel_size", DEFAULT_MODEL_CONFIG.kernel_size)
         adapter_stride = _get_config_value(audio_enc_cfg, "adapter_stride", DEFAULT_MODEL_CONFIG.adapter_stride)
 
-        # Get LLM hidden size from config with multiple fallback options
-        # Priority: audio_encoder_config.llm_dim > text_config.hidden_size > config.hidden_size > default
         n_hidden = None
 
-        # Try audio_encoder_config.llm_dim first (Step-Audio2 specific)
         if audio_enc_cfg:
             n_hidden = _get_config_value(audio_enc_cfg, "llm_dim", None)
 
-        # Try text_config.hidden_size (nested config structure)
         if n_hidden is None:
             text_config = getattr(config, "text_config", None)
             if text_config is not None:
                 n_hidden = _get_config_value(text_config, "hidden_size", None)
 
-        # Try top-level hidden_size
         if n_hidden is None:
             n_hidden = _get_config_value(config, "hidden_size", None)
 
-        # Use default as last resort
         if n_hidden is None:
             n_hidden = DEFAULT_MODEL_CONFIG.hidden_size
 
-        # Initialize audio encoder
         self.encoder = AudioEncoder(
             n_mels=n_mels,
             n_ctx=n_audio_ctx,
@@ -721,15 +657,13 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             n_layer=n_audio_layer,
         )
 
-        # Initialize adapter
         self.adapter = Adaptor(
             n_state=n_audio_state,
-            n_hidden=n_hidden,  # LLM hidden size from config
+            n_hidden=n_hidden,
             kernel_size=kernel_size,
             stride=adapter_stride,
         )
 
-        # Initialize language model (prefer text_config if provided by HF)
         from transformers import PretrainedConfig
 
         text_config = getattr(config, "text_config", None)
@@ -743,7 +677,6 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             }
             arch = model_type_to_arch.get(model_type)
             architectures = [arch] if arch else ["Qwen2ForCausalLM"]
-        # Create a new vllm_config with explicit architecture for the LLM
         lm_vllm_config = vllm_config.with_hf_config(lm_config, architectures=architectures)
         self.language_model = init_vllm_registered_model(
             vllm_config=lm_vllm_config, hf_config=lm_config, prefix=maybe_prefix(prefix, "language_model")
@@ -773,19 +706,12 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if audio_mels is None:
             return None
 
-        # Flatten batch dimensions
         audio_mels = flatten_bn(audio_mels, concat=True)
         audio_lens = flatten_bn(audio_lens, concat=True)
 
-        # Validate n_mels dimension (should be 128)
         expected_n_mels = 128
         if audio_mels.ndim == 3 and audio_mels.size(1) != expected_n_mels:
-            # For profiling compatibility, return None to skip this batch
             return None
-
-        # audio_mels is already in correct format [batch, n_mels, time]
-        # audio_lens contains the actual audio length for each item (used by encoder to ignore padding)
-        # No need to split and restack!
 
         return StepAudio2AudioInputs(
             audio_mels=audio_mels.to(self.dtype).to(self.device),
@@ -801,17 +727,12 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             audio_lens = audio_lens.to(self.device)
 
-        # audio_mels is already in correct format (B, n_mels, T) for Conv1d encoder
-        # Encode audio
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)
 
-        # Adapt to LLM dimension
         audio_features = self.adapter(audio_features)
 
-        # Calculate feature lengths after adapter conv
         audio_feature_lens = (audio_lens - 1) // 2 + 1
 
-        # Split into list
         audio_feature_list = [audio_features[i, : audio_feature_lens[i]] for i in range(audio_features.size(0))]
 
         return audio_feature_list
@@ -864,7 +785,6 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             inputs_embeds=inputs_embeds,
         )
 
-        # Return OmniOutput for multi-stage compatibility
         return OmniOutput(
             text_hidden_states=hidden_states,
             multimodal_outputs={},

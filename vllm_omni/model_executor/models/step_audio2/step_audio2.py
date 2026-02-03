@@ -45,7 +45,6 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        # Mark that this model has multimodal outputs (required by vLLM-Omni framework)
         self.have_multimodal_outputs = True
 
         config = vllm_config.model_config.hf_config
@@ -55,11 +54,9 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         self.multimodal_config = multimodal_config
         self.vllm_config = vllm_config
 
-        # Determine which stage to load
         self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "thinker":
-            # Initialize Thinker (LLM for audio understanding)
             self.thinker = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "thinker"),
@@ -72,7 +69,6 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
             logger.info("Initialized Step-Audio2 Thinker (Stage 1)")
 
         elif self.model_stage == "token2wav":
-            # Initialize Token2Wav (Audio synthesis)
             self.thinker = None
             self.token2wav = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -87,7 +83,6 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         else:
             raise ValueError(f"Invalid model_stage: {self.model_stage}. Must be 'thinker' or 'token2wav'")
 
-        # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )

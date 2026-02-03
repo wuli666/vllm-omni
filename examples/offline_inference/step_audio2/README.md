@@ -14,6 +14,44 @@ Step-Audio2 is a two-stage audio model:
   - Input: Audio tokens + Speaker prompt wav
   - Output: Synthesized audio waveform (24kHz)
 
+## Hardware Requirements
+
+| Mode | GPU Configuration | VRAM Required |
+|------|-------------------|---------------|
+| ASR (S2T) | 1x GPU | ~20-25GB |
+| TTS/S2ST (single GPU) | 1x GPU | ~40-50GB |
+| TTS/S2ST (multi GPU) | 2x GPU | GPU0: ~28GB, GPU1: ~22GB |
+
+**Tested on:**
+- 1x NVIDIA H100 80GB (single-card S2ST)
+- 2x NVIDIA A10 40GB (multi-card S2ST)
+
+**Notes:**
+- Single GPU mode requires high VRAM due to both stages sharing memory
+- Multi GPU mode separates Stage 0 (Thinker) and Stage 1 (Token2Wav) across GPUs
+- VRAM usage can be adjusted via `gpu_memory_utilization` in stage config
+
+## Performance Benchmark
+
+Single request latency comparison between vLLM-Omni and official Step-Audio2 implementation.
+
+| Task | Tokens | vllm-omni | Step-Audio2 | Speedup |
+|------|--------|-----------|-------------|---------|
+| S2ST | ~85 | 5.45s | 7.36s | **1.35x** |
+| S2ST | ~160 | 6.67s | 13.92s | **2.09x** |
+| S2ST | ~315 | 9.42s | 31.50s | **3.34x** |
+| TTS | ~1024 | 16.65s | ~87s | **~5.2x** |
+
+**Key observations:**
+- Speedup increases with sequence length due to vLLM's efficient KV cache management
+- TTS (pure generation) shows the largest speedup (~5x)
+- S2ST benefits from optimized multi-stage pipeline
+
+**Benchmark environment:**
+- GPU: NVIDIA H100 80GB (single card)
+- Model: Step-Audio2-mini
+- Warmup: 1 run, Measured: 3 runs (averaged)
+
 ## Installation
 
 Make sure you have installed vLLM-Omni and all required dependencies:
