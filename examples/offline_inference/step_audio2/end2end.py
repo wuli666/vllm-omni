@@ -178,10 +178,10 @@ def get_audio_to_audio_query(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": audio_data,  # ← ONLY this should be processed by Thinker
+                "audio": audio_data,  
             },
         },
-        limit_mm_per_prompt={"audio": 1},  # ← Only 1 audio input allowed
+        limit_mm_per_prompt={"audio": 1},  
     )
 
 
@@ -193,47 +193,19 @@ query_map = {
 
 
 def main(args):
-    import logging
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    logger = logging.getLogger(__name__)
-
     # Use local model path or HuggingFace model name
     if not args.model:
-        logger.error("Model path is required!")
-        logger.info("Usage:")
-        logger.info("  Local model: --model /path/to/your/step-audio-2")
-        logger.info("  HuggingFace: --model stepfun-ai/Step-Audio2-mini")
         sys.exit(1)
 
     model_name = args.model
 
     # Check if it's a local path
     if os.path.isdir(model_name):
-        logger.info(f"Using local model: {model_name}")
-
         # Verify essential files exist
         config_path = os.path.join(model_name, "config.json")
         if not os.path.exists(config_path):
-            logger.error(f"Model directory missing config.json: {config_path}")
-            logger.info("Expected directory structure:")
-            logger.info(f"  {model_name}/")
-            logger.info("    ├── config.json        (required)")
-            logger.info("    ├── model.safetensors or pytorch_model.bin")
-            logger.info("    ├── tokenizer.json")
-            logger.info("    └── token2wav/        (Token2Wav models)")
             sys.exit(1)
 
-        # Check token2wav directory
-        token2wav_path = os.path.join(model_name, "token2wav")
-        if not os.path.isdir(token2wav_path):
-            logger.warning(f"Missing token2wav directory: {token2wav_path}")
-            logger.warning("Stage 1 (Token2Wav) may not work properly")
-        else:
-            logger.info("Token2Wav directory exists")
-    else:
-        logger.info(f"Using HuggingFace model: {model_name}")
-        logger.info("Model will be cached in ~/.cache/huggingface/hub/")
 
     # Get query configuration
     query_func = query_map[args.query_type]
@@ -260,9 +232,6 @@ def main(args):
         raise ValueError(f"Unknown query type: {args.query_type}")
 
     # Initialize vLLM-Omni with Step-Audio2
-    logger.info(f"Initializing Step-Audio2 with model: {model_name}")
-    logger.info(f"Query type: {args.query_type}")
-
     # Resolve stage config path
     if args.stage_configs_path:
         stage_config_path = args.stage_configs_path
@@ -271,8 +240,6 @@ def main(args):
         stage_config_path = str(
             Path(__file__).parent.parent.parent.parent / "vllm_omni/model_executor/stage_configs/step_audio_2.yaml"
         )
-
-    logger.info(f"Using stage config: {stage_config_path}")
 
     omni_llm = Omni(
         model=model_name,
@@ -336,31 +303,20 @@ def main(args):
     else:
         prompts = [query_result.inputs]
 
-    logger.info(f"Running inference on {len(prompts)} prompt(s)...")
-
     # Run inference
-    logger.info("Calling omni_llm.generate()...")
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
-    logger.info("Generation completed! Processing outputs...")
 
     # Create output directory
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # Process outputs from each stage
-    logger.info(f"Processing {len(omni_outputs)} stage outputs...")
     for stage_idx, stage_outputs in enumerate(omni_outputs):
-        logger.info(f"Processing stage {stage_idx}, type: {stage_outputs.final_output_type}")
         if stage_outputs.final_output_type == "text":
             # Stage 0 (Thinker) text output
-            logger.info("=" * 50)
-            logger.info("Stage 0 (Thinker) - Text Output")
-
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
                 text_output = output.outputs[0].text
-
-                logger.info(f"[Request {request_id}] Output: {text_output[:100]}...")
 
                 # Save to file
                 out_txt = os.path.join(output_dir, f"{request_id:05d}_text.txt")
@@ -368,13 +324,9 @@ def main(args):
                     f.write(f"Prompt:\n{prompts[request_id]['prompt']}\n\n")
                     f.write(f"Output:\n{text_output}\n")
 
-                logger.info(f"Text saved to {out_txt}")
 
         elif stage_outputs.final_output_type == "audio":
             # Stage 1 (Token2Wav) audio output
-            logger.info("=" * 50)
-            logger.info("Stage 1 (Token2Wav) - Audio Output")
-
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
 
@@ -391,14 +343,6 @@ def main(args):
                     output_wav = os.path.join(output_dir, f"{request_id:05d}_output.wav")
                     audio_numpy = audio_tensor.detach().cpu().numpy()
                     sf.write(output_wav, audio_numpy, samplerate=24000)
-
-                    duration = len(audio_numpy) / 24000
-                    logger.info(f"[Request {request_id}] Audio duration: {duration:.2f}s, saved to {output_wav}")
-                else:
-                    logger.warning(f"[Request {request_id}] No audio output generated")
-
-    logger.info("=" * 50)
-    logger.info(f"All outputs saved to: {output_dir}")
 
 
 def parse_args():
