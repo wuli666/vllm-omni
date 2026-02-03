@@ -6,7 +6,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from ..factory import OmniConnectorFactory
 from .config import ConnectorSpec, OmniTransferConfig
@@ -21,8 +21,8 @@ logger = get_connector_logger(__name__)
 
 
 def initialize_connectors_from_config(
-    config_path: Optional[Union[str, Path]] = None, default_shm_threshold: int = 65536
-) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
+    config_path: str | Path | None = None, default_shm_threshold: int = 65536
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """
     Initialize connectors from configuration file.
 
@@ -64,9 +64,7 @@ def create_connectors_from_config(
     return connectors
 
 
-def get_connectors_config_for_stage(
-    transfer_config: Optional[OmniTransferConfig], stage_id: Union[str, int]
-) -> dict[str, Any]:
+def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
     """
     Extract connector configurations relevant for a specific stage worker.
 
@@ -93,15 +91,17 @@ def get_connectors_config_for_stage(
         # (Worker needs to create connectors to receive data)
         if to_stage == target_stage:
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
+        elif from_stage == target_stage and target_stage == "0":
+            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
 
     return stage_connectors_config
 
 
 def load_omni_transfer_config(
-    config_path: Optional[Union[str, Path]] = None,
-    config_dict: Optional[dict[str, Any]] = None,
+    config_path: str | Path | None = None,
+    config_dict: dict[str, Any] | None = None,
     default_shm_threshold: int = 65536,
-) -> Optional[OmniTransferConfig]:
+) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
         # Even if no config provided, we might want to return a default config with SHM connectors
@@ -239,8 +239,8 @@ def load_omni_transfer_config(
 
 
 def initialize_orchestrator_connectors(
-    config_path: Optional[str], worker_backend: Optional[str] = "multi_process", shm_threshold_bytes: int = 65536
-) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
+    config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
@@ -259,7 +259,7 @@ def initialize_orchestrator_connectors(
 
 
 def get_stage_connector_config(
-    transfer_config: Optional[OmniTransferConfig],
+    transfer_config: OmniTransferConfig | None,
     stage_id: int,
 ) -> dict[str, Any]:
     """Return the serialized connector config payload for a specific stage."""
@@ -280,7 +280,7 @@ def get_stage_connector_config(
 def build_stage_connectors(
     stage_id: int,
     connectors_config: dict[str, Any],
-) -> Optional[dict[tuple[str, str], Any]]:
+) -> dict[tuple[str, str], Any] | None:
     """Instantiate OmniConnectors for a stage based on config."""
     if not connectors_config:
         return {}
@@ -294,7 +294,7 @@ def build_stage_connectors(
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
-    # 将字典格式的配置转换为ConnectorSpec对象
+    # Convert dictionary-formatted config to ConnectorSpec objects
     stage_connector_specs = {}
     for input_key, config in connectors_config.items():
         if not input_key.startswith("from_stage_"):
@@ -312,7 +312,7 @@ def build_stage_connectors(
         stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
 
     try:
-        # 使用统一的连接器创建逻辑
+        # Use unified connector creation logic
         connectors = create_connectors_from_config(stage_connector_specs)
     except Exception as exc:  # pragma: no cover - defensive logging
         # Fail fast so the stage does not start with missing connectors.
@@ -320,3 +320,58 @@ def build_stage_connectors(
         raise
 
     return connectors
+
+
+def resolve_omni_kv_config_for_stage(
+    transfer_cfg: OmniTransferConfig | None, stage_id: int | str
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Resolve connector configuration for a specific stage (Sender/Receiver).
+
+    This determines the primary connector configuration to be injected into the
+    engine arguments, prioritizing outgoing edges (Sender role).
+    """
+    if not transfer_cfg or not getattr(transfer_cfg, "connectors", None):
+        return None, None, None
+
+    stage_id_str = str(stage_id)
+
+    # Find outgoing edges (Sender logic)
+    outgoing = [
+        (to_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if from_stage == stage_id_str
+    ]
+
+    # Find incoming edges (Receiver logic)
+    incoming = [
+        (from_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if to_stage == stage_id_str
+    ]
+
+    omni_conn_cfg = None
+    omni_from = None
+    omni_to = None
+
+    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver)
+    if outgoing:
+        if len(outgoing) > 1:
+            logger.debug(
+                "Stage-%s has %d outgoing edges; using the smallest to_stage",
+                stage_id,
+                len(outgoing),
+            )
+        outgoing.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+        to_s, spec = outgoing[0]
+        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_from = stage_id_str
+        omni_to = str(to_s)
+    elif incoming:
+        # For receiver, pick one incoming edge to configure the connector
+        incoming.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+        from_s, spec = incoming[0]
+        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_from = str(from_s)
+        omni_to = stage_id_str
+
+    return omni_conn_cfg, omni_from, omni_to

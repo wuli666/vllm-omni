@@ -2,17 +2,23 @@ import gc
 import os
 
 import torch
-from vllm.model_executor import set_random_seed
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import GiB_bytes, MemorySnapshot
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.mixins import OmniWorkerMixin
+
+logger = init_logger(__name__)
 
 
-class GPUARWorker(GPUWorker):
+class GPUARWorker(OmniWorkerMixin, GPUWorker):
     """GPU worker for autoregressive omni model stages.
 
     Extends the base GPUWorker to initialize and manage autoregressive
@@ -20,19 +26,35 @@ class GPUARWorker(GPUWorker):
     """
 
     def init_device(self):
-        """Initialize the GPU device and autoregressive model runner.
-
-        Sets up CUDA device, initializes distributed environment,
-        sets random seed, and creates a GPUARModelRunner instance.
-
-        Raises:
-            ValueError: If free GPU memory is insufficient for the
-                requested memory utilization
-            RuntimeError: If device type is not supported
-        """
-        if self.device_config.device.type == "cuda":
+        if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            parallel_config = self.parallel_config
+            if (
+                parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
+                and parallel_config.data_parallel_backend != "ray"
+                and parallel_config.nnodes_within_dp == 1
+            ):
+                # Use local DP rank if available, otherwise use global DP rank.
+                dp_local_rank = self.parallel_config.data_parallel_rank_local
+                if dp_local_rank is None:
+                    dp_local_rank = self.parallel_config.data_parallel_index
+
+                tp_pp_world_size = (
+                    self.parallel_config.pipeline_parallel_size * self.parallel_config.tensor_parallel_size
+                )
+
+                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                self.local_rank += dp_local_rank * tp_pp_world_size
+                assert self.local_rank < torch.cuda.device_count(), (
+                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                )
+                visible_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                assert self.parallel_config.local_world_size <= visible_device_count, (
+                    f"local_world_size ({self.parallel_config.local_world_size}) must "
+                    f"be less than or equal to the number of visible devices "
+                    f"({visible_device_count})."
+                )
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
 
@@ -58,27 +80,24 @@ class GPUARWorker(GPUWorker):
             torch.cuda.empty_cache()
 
             # take current memory snapshot
-            self.init_snapshot = MemorySnapshot()
-            self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
-            if self.init_snapshot.free_memory < self.requested_memory:
-
-                def GiB(b):
-                    return round(b / GiB_bytes, 2)
-
-                raise ValueError(
-                    f"Free memory on device "
-                    f"({GiB(self.init_snapshot.free_memory)}/"
-                    f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
-                    f"is less than desired GPU memory utilization "
-                    f"({self.cache_config.gpu_memory_utilization}, "
-                    f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
-                    f"utilization or reduce GPU memory used by other processes."
-                )
+            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+            logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
+        # Initialize workspace manager
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
+
+        if self.use_v2_model_runner:
+            # OMNI: v2 model runner does not yet include omni hooks.
+            logger.warning("OMNI GPUARWorker forces v1 model runner for omni hooks.")
+            self.use_v2_model_runner = False
+
         # Construct the model runner
-        self.model_runner: GPUARModelRunner = GPUARModelRunner(self.vllm_config, self.device)
+        self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

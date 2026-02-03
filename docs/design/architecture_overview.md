@@ -28,8 +28,8 @@ According to analysis for current popular open-source models, most of them have 
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png">
-    <img alt="Qwen-Image" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png" width=30%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png">
+    <img alt="Qwen-Image" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png" width=30%>
   </picture>
 </p>
 
@@ -38,8 +38,8 @@ According to analysis for current popular open-source models, most of them have 
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png">
-    <img alt="Bagel" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png" width=30%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png">
+    <img alt="Bagel" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png" width=30%>
   </picture>
 </p>
 
@@ -64,13 +64,13 @@ According to analysis for current popular open-source models, most of them have 
 
 ## Key Components
 
-| Component | Description |
-|-----------|-------------|
-| **OmniRouter** | provide an intelligent router for Omni-modality requests dispatch |
-| **EntryPoints** | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni) and provide the OmniStage abstraction for different AR/DiT stages |
-| **AR** | adapted for omni-modality models while inheriting efficient features from vLLM, such as cache management |
-| **Diffusion** | natively implemented and optimized using acceleration components |
-| **OmniConnector** | supports fully disaggregation based on E/P/D/G (Encoding/Processing/Decoding/Generation) disaggregation across stages |
+| Component         | Description                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **OmniRouter**    | provide an intelligent router for Omni-modality requests dispatch                                                                        |
+| **EntryPoints**   | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni) and provide the OmniStage abstraction for different AR/DiT stages |
+| **AR**            | adapted for omni-modality models while inheriting efficient features from vLLM, such as cache management                                 |
+| **Diffusion**     | natively implemented and optimized using acceleration components                                                                         |
+| **OmniConnector** | supports fully disaggregation based on E/P/D/G (Encoding/Processing/Decoding/Generation) disaggregation across stages                    |
 
 Disaggregated stages are managed through configuration, such as in the Qwen3-Omni example, where stages like Thinker, Talker, and Code2wav are defined as separate OmniStage instances with specific resources and input/output type.
 
@@ -192,4 +192,4 @@ curl -sS -X POST http://localhost:8091/v1/chat/completions \
 }
 ```
 
-For more usages, please refer to [examples](../user_guide/examples/).
+For more usages, please refer to [examples](https://github.com/vllm-project/vllm-omni/tree/main/examples).

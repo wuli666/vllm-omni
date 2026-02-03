@@ -34,10 +34,10 @@ CATEGORIES = {
         "name": "Core",
         "description": "Core scheduling and caching components.",
     },
-    "model_executor": {
-        "name": "Model Executor",
-        "description": "Model execution components.",
-    },
+    # "model_executor": {
+    #     "name": "Model Executor",
+    #     "description": "Model execution components.",
+    # },
     "config": {
         "name": "Configuration",
         "description": "Configuration classes.",
@@ -135,6 +135,15 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
             # Get module path
             relative_path = py_file.relative_to(ROOT_DIR)
             module_path = str(relative_path.with_suffix("")).replace("/", ".").replace("\\", ".")
+
+            # Skip excluded modules (avoid importing vllm during docs build)
+            excluded_prefixes = [
+                "vllm_omni.diffusion.models.qwen_image",
+                "vllm_omni.entrypoints.async_diffusion",
+                "vllm_omni.entrypoints.openai",
+            ]
+            if any(module_path.startswith(prefix) for prefix in excluded_prefixes):
+                continue
 
             # Handle __init__.py - use parent module path
             if py_file.name == "__init__.py":

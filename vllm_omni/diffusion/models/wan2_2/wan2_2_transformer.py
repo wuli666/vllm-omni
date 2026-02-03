@@ -3,7 +3,7 @@
 
 import math
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,11 +12,16 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.logger import init_logger
+from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 
 logger = init_logger(__name__)
 
@@ -127,7 +132,7 @@ class WanRotaryPosEmbed(nn.Module):
 class WanImageEmbedding(nn.Module):
     """Image embedding module for I2V tasks."""
 
-    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len: Optional[int] = None):
+    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len: int | None = None):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(in_features)
@@ -159,8 +164,8 @@ class WanTimeTextImageEmbedding(nn.Module):
         time_freq_dim: int,
         time_proj_dim: int,
         text_embed_dim: int,
-        image_embed_dim: Optional[int] = None,
-        pos_embed_seq_len: Optional[int] = None,
+        image_embed_dim: int | None = None,
+        pos_embed_seq_len: int | None = None,
     ):
         super().__init__()
 
@@ -178,9 +183,9 @@ class WanTimeTextImageEmbedding(nn.Module):
         self,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        encoder_hidden_states_image: Optional[torch.Tensor] = None,
-        timestep_seq_len: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        timestep_seq_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         timestep = self.timesteps_proj(timestep)
         if timestep_seq_len is not None:
             timestep = timestep.unflatten(0, (-1, timestep_seq_len))
@@ -250,7 +255,7 @@ class WanSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # Fused QKV projection
         qkv, _ = self.to_qkv(hidden_states)
@@ -296,7 +301,7 @@ class WanCrossAttention(nn.Module):
         head_dim: int,
         eps: float = 1e-5,
         dropout: float = 0.0,
-        added_kv_proj_dim: Optional[int] = None,
+        added_kv_proj_dim: int | None = None,
     ):
         super().__init__()
 
@@ -413,7 +418,7 @@ class WanTransformerBlock(nn.Module):
         ffn_dim: int,
         num_heads: int,
         eps: float = 1e-6,
-        added_kv_proj_dim: Optional[int] = None,
+        added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
     ):
         super().__init__()
@@ -497,6 +502,16 @@ class WanTransformer3DModel(nn.Module):
     This is an optimized version of the diffusers WanTransformer3DModel that uses
     vLLM's efficient QKVParallelLinear and RMSNorm implementations.
 
+    Sequence Parallelism:
+        This model supports non-intrusive SP via _sp_plan. The plan specifies:
+        - RoPE (cos/sin) splitting via rope module's split_output
+        - hidden_states splitting at first transformer block input
+        - Output gathering at proj_out layer
+
+        The video sequence (flattened patches) is parallelized across GPUs.
+
+        Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+
     Args:
         patch_size: 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
         num_attention_heads: Number of attention heads
@@ -515,6 +530,35 @@ class WanTransformer3DModel(nn.Module):
         pos_embed_seq_len: Optional position embedding sequence length
     """
 
+    _repeated_blocks = ["WanTransformerBlock"]
+    _layerwise_offload_blocks_attr = "blocks"
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
+
+    # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
+    #
+    # The _sp_plan specifies sharding/gathering at module boundaries:
+    # - rope: Split both RoPE outputs (freqs_cos, freqs_sin) via split_output=True
+    # - blocks.0: Split hidden_states input at the first transformer block
+    # - proj_out: Gather outputs after the final projection layer
+    #
+    # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
+    _sp_plan = {
+        # Shard RoPE embeddings after rope module computes them
+        "rope": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_cos [1, seq, 1, dim]
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_sin [1, seq, 1, dim]
+        },
+        # Shard hidden_states at first transformer block input
+        # (after patch_embedding + flatten + transpose)
+        "blocks.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),  # [B, seq, dim]
+        },
+        # Gather at proj_out (final linear projection before unpatchify)
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
     def __init__(
         self,
         patch_size: tuple[int, int, int] = (1, 2, 2),
@@ -528,10 +572,10 @@ class WanTransformer3DModel(nn.Module):
         num_layers: int = 40,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
-        image_dim: Optional[int] = None,
-        added_kv_proj_dim: Optional[int] = None,
+        image_dim: int | None = None,
+        added_kv_proj_dim: int | None = None,
         rope_max_seq_len: int = 1024,
-        pos_embed_seq_len: Optional[int] = None,
+        pos_embed_seq_len: int | None = None,
     ):
         super().__init__()
 
@@ -563,7 +607,12 @@ class WanTransformer3DModel(nn.Module):
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
-        self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embedding = Conv3dLayer(
+            in_channels=in_channels,
+            out_channels=inner_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
 
         # 2. Condition embeddings
         self.condition_embedder = WanTimeTextImageEmbedding(
@@ -598,18 +647,21 @@ class WanTransformer3DModel(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         encoder_hidden_states: torch.Tensor,
-        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        encoder_hidden_states_image: torch.Tensor | None = None,
         return_dict: bool = True,
-        attention_kwargs: Optional[dict[str, Any]] = None,
-    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        attention_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
+        # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         rotary_emb = self.rope(hidden_states)
 
+        # Patch embedding and flatten to sequence
+        # (hidden_states is sharded at blocks.0 input by _sp_plan)
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 

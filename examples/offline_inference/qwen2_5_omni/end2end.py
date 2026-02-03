@@ -6,7 +6,8 @@ with the correct prompt format on Qwen2.5-Omni
 """
 
 import os
-from typing import NamedTuple, Optional
+import time
+from typing import NamedTuple
 
 import librosa
 import numpy as np
@@ -17,7 +18,7 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -58,9 +59,9 @@ def get_text_query(question: str = None) -> QueryResult:
 
 
 def get_mixed_modalities_query(
-    video_path: Optional[str] = None,
-    image_path: Optional[str] = None,
-    audio_path: Optional[str] = None,
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
     num_frames: int = 16,
     sampling_rate: int = 16000,
 ) -> QueryResult:
@@ -114,12 +115,12 @@ def get_mixed_modalities_query(
 
 
 def get_use_audio_in_video_query(
-    video_path: Optional[str] = None, num_frames: int = 16, sampling_rate: int = 16000
+    video_path: str | None = None, num_frames: int = 16, sampling_rate: int = 16000
 ) -> QueryResult:
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -151,7 +152,7 @@ def get_use_audio_in_video_query(
     )
 
 
-def get_multi_audios_query(audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
+def get_multi_audios_query(audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
     question = "Are these two audio clips the same?"
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
@@ -190,7 +191,7 @@ def get_multi_audios_query(audio_path: Optional[str] = None, sampling_rate: int 
     )
 
 
-def get_image_query(question: str = None, image_path: Optional[str] = None) -> QueryResult:
+def get_image_query(question: str = None, image_path: str | None = None) -> QueryResult:
     if question is None:
         question = "What is the content of this image?"
     prompt = (
@@ -219,7 +220,7 @@ def get_image_query(question: str = None, image_path: Optional[str] = None) -> Q
     )
 
 
-def get_video_query(question: str = None, video_path: Optional[str] = None, num_frames: int = 16) -> QueryResult:
+def get_video_query(question: str = None, video_path: str | None = None, num_frames: int = 16) -> QueryResult:
     if question is None:
         question = "Why is this video funny?"
     prompt = (
@@ -247,7 +248,7 @@ def get_video_query(question: str = None, video_path: Optional[str] = None, num_
     )
 
 
-def get_audio_query(question: str = None, audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
+def get_audio_query(question: str = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (
@@ -277,9 +278,9 @@ def get_audio_query(question: str = None, audio_path: Optional[str] = None, samp
 
 
 query_map = {
-    "mixed_modalities": get_mixed_modalities_query,
+    "use_mixed_modalities": get_mixed_modalities_query,
     "use_audio_in_video": get_use_audio_in_video_query,
-    "multi_audios": get_multi_audios_query,
+    "use_multi_audios": get_multi_audios_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
     "use_audio": get_audio_query,
@@ -319,12 +320,10 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-
     omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
-        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
-        init_sleep_seconds=args.init_sleep_seconds,
+        stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
@@ -373,19 +372,30 @@ def main(args):
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
-    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for i, prompt in enumerate(prompts):
+            prompt["modalities"] = output_modalities
+
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    if profiler_enabled:
+        omni_llm.start_profile(stages=[0])
+    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
-    for stage_outputs in omni_outputs:
+
+    total_requests = len(prompts)
+    processed_count = 0
+    for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 text_output = output.outputs[0].text
                 # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
                 lines = []
                 lines.append("Prompt:\n")
                 lines.append(str(prompt_text) + "\n")
@@ -399,11 +409,23 @@ def main(args):
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
-                audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                request_id = output.request_id
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+
+        processed_count += len(stage_outputs.request_output)
+        if profiler_enabled and processed_count >= total_requests:
+            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            # Stop the profiler while workers are still alive
+            omni_llm.stop_profile()
+
+            print("[Info] Waiting 30s for workers to write massive trace files to disk...")
+            time.sleep(30)
+            print("[Info] Trace export wait finished.")
+
+    omni_llm.close()
 
 
 def parse_args():
@@ -412,7 +434,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="mixed_modalities",
+        default="use_mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -423,10 +445,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
@@ -504,6 +526,18 @@ def parse_args():
         type=str,
         default=None,
         help="Address of the Ray cluster.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Modalities to use for the prompts.",
+    )
+    parser.add_argument(
+        "--py-generator",
+        action="store_true",
+        default=False,
+        help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     return parser.parse_args()
 

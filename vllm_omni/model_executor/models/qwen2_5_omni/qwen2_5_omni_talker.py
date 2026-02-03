@@ -1,6 +1,5 @@
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -10,10 +9,8 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAu
 # from vllm.attention import AttentionMetadata  # unused import
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
@@ -24,13 +21,14 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
-    merge_multimodal_embeddings,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import Qwen2_5OmniConditionalGenerationMixin
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -59,7 +57,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-
+        self.vllm_config = vllm_config
         self.prefix = prefix
         self.quant_config = quant_config
 
@@ -69,13 +67,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         else:
             self.config = config
 
-        self.thinker_to_talker_proj = ColumnParallelLinear(
+        self.thinker_to_talker_proj = nn.Linear(
             self.config.embedding_size,
             self.config.hidden_size,
-            bias=True,
-            gather_output=True,
-            skip_bias_add=False,
-            quant_config=quant_config,
         )
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
@@ -84,6 +78,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             architectures=["Qwen2ForCausalLM_old"],
         )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+        # suppress start id
+        self.suppress_start_id = None
 
     def init_multi_modal(self, thinker_config):
         self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
@@ -104,35 +101,33 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
 
         return Sampler()
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-            # TODO (ywang96): support overlapping modalitiy embeddings so that
-            # `use_audio_in_video` will work on V1.
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                multimodal_embeddings,
-                [
-                    self.config.image_token_index,
-                    self.config.video_token_index,
-                    self.config.audio_token_index,
-                ],
-            )
-        return inputs_embeds
+        # This is to satisfy the type checker for each overload
+        if multimodal_embeddings is None or is_multimodal is None:
+            return super().embed_input_ids(input_ids)
+
+        return super().embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor = None,
         positions: torch.Tensor = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         assert input_ids is not None or inputs_embeds is not None, "input_ids or inputs_embeds must be provided"
         # forward_context: ForwardContext = get_forward_context()  # unused variable
 
@@ -140,12 +135,12 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             inputs_embeds = None
         elif inputs_embeds is None:
             # for profile_run:
-            inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = self.embed_input_ids(input_ids)
 
         input_ids = None
 
         # projection
-        inputs_embeds, _ = self.thinker_to_talker_proj(inputs_embeds)
+        inputs_embeds = self.thinker_to_talker_proj(inputs_embeds)
 
         hidden_states = self.language_model.model(
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
@@ -153,12 +148,27 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         return hidden_states
 
     def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:
+        # suppress token IDs unsupported by token2wav
+        if self.suppress_start_id and self.suppress_start_id < logits.size(-1):
+            # skip the end token id.
+            if hasattr(self.config, "tts_codec_end_token_id"):
+                end_id = int(getattr(self.config, "tts_codec_end_token_id"))
+                if self.suppress_start_id == end_id:
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                elif self.suppress_start_id < end_id:
+                    logits[..., self.suppress_start_id : end_id] = -1e9
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                else:
+                    logits[..., self.suppress_start_id : logits.size(-1)] = -1e9
+            else:
+                raise ValueError("config must have tts_codec_end_token_id attribute")
+
         if hasattr(self.config, "tts_codec_start_token_id"):
             bos_id = int(getattr(self.config, "tts_codec_start_token_id"))
             logits[..., bos_id] = -1e9
         return logits
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.language_model.compute_logits(hidden_states)
         logits = self.bad_word_processor(logits)
         return logits
@@ -167,7 +177,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         return self.language_model.sample(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -214,7 +224,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
                 mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
         return mm_input_by_modality
 
-    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -237,3 +247,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
                 audio_embeddings = self._process_audio_input(multimodal_input)
                 multimodal_embeddings += audio_embeddings
         return multimodal_embeddings
+
+    def set_suppress_start_id(self, start_id: int):
+        self.suppress_start_id = start_id
+        self.logger.debug(f"Set suppress start id to {self.suppress_start_id}")

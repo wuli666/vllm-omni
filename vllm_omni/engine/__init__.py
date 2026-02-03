@@ -2,20 +2,14 @@
 Engine components for vLLM-Omni.
 """
 
-import time
-from collections.abc import Mapping
-from typing import Any, Optional, Union
+from typing import Any
 
 import msgspec
 import torch
 from vllm.v1.engine import (
-    EngineCoreEvent,
+    EngineCoreOutput,
+    EngineCoreOutputs,
     EngineCoreRequest,
-    FinishReason,
-    LogprobsLists,
-    LogprobsTensors,
-    SchedulerStats,
-    UtilityOutput,
 )
 
 
@@ -42,12 +36,12 @@ class AdditionalInformationEntry(msgspec.Struct):
     """
 
     # Tensor form
-    tensor_data: Optional[bytes] = None
-    tensor_shape: Optional[list[int]] = None
-    tensor_dtype: Optional[str] = None
+    tensor_data: bytes | None = None
+    tensor_shape: list[int] | None = None
+    tensor_dtype: str | None = None
 
     # List form
-    list_data: Optional[list[Any]] = None
+    list_data: list[Any] | None = None
 
 
 class AdditionalInformationPayload(msgspec.Struct):
@@ -74,65 +68,14 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     """
 
     # Optional prompt embeddings (direct-transfer version)
-    prompt_embeds: Optional[PromptEmbedsPayload] = None
+    prompt_embeds: PromptEmbedsPayload | None = None
     # Optional additional information dictionary (serialized)
-    additional_information: Optional[AdditionalInformationPayload] = None
+    additional_information: AdditionalInformationPayload | None = None
 
 
-class OmniEngineCoreOutput(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    request_id: str
-    new_token_ids: list[int]
-
-    new_logprobs: Optional[LogprobsLists] = None
-    new_prompt_logprobs_tensors: Optional[LogprobsTensors] = None
-
-    pooling_output: Optional[dict[str, torch.Tensor]] = None
-
-    finish_reason: Optional[FinishReason] = None
-    stop_reason: Union[int, str, None] = None
-    events: Optional[list[EngineCoreEvent]] = None
-    kv_transfer_params: Optional[dict[str, Any]] = None
-
-    trace_headers: Optional[Mapping[str, str]] = None
-    # The number of tokens with prefix cache hits.
-    num_cached_tokens: int = 0
-
-    @property
-    def finished(self) -> bool:
-        return self.finish_reason is not None
+class OmniEngineCoreOutput(EngineCoreOutput):
+    pooling_output: dict[str, torch.Tensor] | None = None
 
 
-class OmniEngineCoreOutputs(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    # NOTE(Nick): We could consider ways to make this more compact,
-    # e.g. columnwise layout
-
-    engine_index: int = 0
-
-    # [num_reqs]
+class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
-    scheduler_stats: Optional[SchedulerStats] = None
-    timestamp: float = 0.0
-
-    utility_output: Optional[UtilityOutput] = None
-    finished_requests: Optional[set[str]] = None
-
-    # In DP case, used to signal that the current wave of requests
-    # has finished and the engines are paused.
-    wave_complete: Optional[int] = None
-    # In DP case, used to signal that a request was received for an
-    # "old" wave, so the next wave needs to be started in other engines.
-    start_wave: Optional[int] = None
-
-    def __post_init__(self):
-        if self.timestamp == 0.0:
-            self.timestamp = time.monotonic()
