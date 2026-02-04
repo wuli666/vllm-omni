@@ -29,7 +29,7 @@ import numpy as np
 import soundfile as sf
 from vllm.assets.audio import AudioAsset
 from vllm.sampling_params import SamplingParams
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -178,10 +178,10 @@ def get_audio_to_audio_query(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": audio_data,  
+                "audio": audio_data,
             },
         },
-        limit_mm_per_prompt={"audio": 1},  
+        limit_mm_per_prompt={"audio": 1},
     )
 
 
@@ -205,7 +205,6 @@ def main(args):
         config_path = os.path.join(model_name, "config.json")
         if not os.path.exists(config_path):
             sys.exit(1)
-
 
     # Get query configuration
     query_func = query_map[args.query_type]
@@ -310,12 +309,27 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    def _get_request_index(req_id: str, fallback: int) -> int:
+        """Parse request index from vLLM request_id.
+
+        vLLM may return IDs like "0_<uuid>". Use the leading integer if present,
+        otherwise fall back to the loop index.
+        """
+        try:
+            return int(req_id)
+        except (TypeError, ValueError):
+            if isinstance(req_id, str):
+                head = req_id.split("_", 1)[0]
+                if head.isdigit():
+                    return int(head)
+        return fallback
+
     # Process outputs from each stage
     for stage_idx, stage_outputs in enumerate(omni_outputs):
         if stage_outputs.final_output_type == "text":
             # Stage 0 (Thinker) text output
-            for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+            for i, output in enumerate(stage_outputs.request_output):
+                request_id = _get_request_index(output.request_id, i)
                 text_output = output.outputs[0].text
 
                 # Save to file
@@ -324,14 +338,17 @@ def main(args):
                     f.write(f"Prompt:\n{prompts[request_id]['prompt']}\n\n")
                     f.write(f"Output:\n{text_output}\n")
 
-
         elif stage_outputs.final_output_type == "audio":
             # Stage 1 (Token2Wav) audio output
-            for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+            for i, output in enumerate(stage_outputs.request_output):
+                request_id = _get_request_index(output.request_id, i)
 
                 # Get audio tensor (24kHz)
-                mm_out = output.multimodal_output or {}
+                mm_out = {}
+                if hasattr(output, "multimodal_output") and output.multimodal_output:
+                    mm_out = output.multimodal_output
+                elif output.outputs and hasattr(output.outputs[0], "multimodal_output"):
+                    mm_out = output.outputs[0].multimodal_output or {}
                 audio_tensor = None
                 for key in ("audio", "wav", "waveform", "audio_pcm", "pcm", "model_outputs"):
                     if key in mm_out and mm_out[key] is not None:

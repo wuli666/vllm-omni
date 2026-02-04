@@ -24,26 +24,26 @@ from transformers.processing_utils import ProcessorMixin
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import (
+    _merge_multimodal_embeddings,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
-    merge_multimodal_embeddings,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
     MultiModalFieldConfig,
-    MultiModalKwargs,
+    MultiModalKwargsItems,
     NestedTensors,
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -450,6 +450,7 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, object] | None = None,
     ) -> MultiModalDataDict:
         audio_len = 16000 * 25
         num_audios = mm_counts.get("audio", 0)
@@ -492,7 +493,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
@@ -706,8 +707,27 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if audio_mels is None:
             return None
 
-        audio_mels = flatten_bn(audio_mels, concat=True)
-        audio_lens = flatten_bn(audio_lens, concat=True)
+        if isinstance(audio_mels, torch.Tensor):
+            if audio_mels.dim() >= 4:
+                audio_mels = audio_mels.flatten(0, 1)
+            elif audio_mels.dim() == 3:
+                # Already (B, n_mels, T)
+                pass
+            elif audio_mels.dim() == 2:
+                audio_mels = audio_mels.unsqueeze(0)
+            else:
+                return None
+        else:
+            audio_mels = flatten_bn(audio_mels, concat=True)
+
+        if isinstance(audio_lens, torch.Tensor):
+            if audio_lens.dim() >= 2:
+                audio_lens = audio_lens.flatten(0, 1)
+            elif audio_lens.dim() == 0:
+                audio_lens = audio_lens.unsqueeze(0)
+            # dim == 1 is already fine
+        else:
+            audio_lens = flatten_bn(audio_lens, concat=True)
 
         expected_n_mels = 128
         if audio_mels.ndim == 3 and audio_mels.size(1) != expected_n_mels:
@@ -746,6 +766,13 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_embeddings = self._process_audio_input(audio_input)
             return audio_embeddings
 
+    def embed_multimodal(self, **kwargs: object) -> NestedTensors:
+        """vLLM multimodal encoder entrypoint."""
+        audio_embeddings = self.get_multimodal_embeddings(**kwargs)
+        if audio_embeddings is None:
+            return []
+        return audio_embeddings
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -754,7 +781,7 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         """Get input embeddings with multimodal fusion"""
         inputs_embeds = self.language_model.model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
+            inputs_embeds = _merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID
             )
         return inputs_embeds

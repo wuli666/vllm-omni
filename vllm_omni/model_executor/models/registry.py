@@ -68,6 +68,7 @@ _OMNI_MODELS = {
         "step_audio2",
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
+    ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts",

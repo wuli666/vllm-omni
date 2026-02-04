@@ -203,6 +203,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
 
         model_path = getattr(self.config, "token2wav_path", None)
@@ -228,6 +229,15 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
     @property
     def sampler(self):
         return Sampler()
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        is_multimodal=None,
+    ) -> torch.Tensor:
+        hidden_size = self.vllm_config.model_config.get_hidden_size()
+        return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, hidden_size)
 
     def forward(
         self,

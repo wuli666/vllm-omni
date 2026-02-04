@@ -273,7 +273,7 @@ def test_audio_to_text_and_audio(step_audio2_runner: type[StepAudio2OmniRunner],
 
         if audio_output is not None:
             assert len(audio_output.request_output) > 0
-            audio_tensor = audio_output.request_output[0].multimodal_output.get("audio")
+            audio_tensor = audio_output.request_output[0].outputs[0].multimodal_output.get("audio")
             if audio_tensor is not None:
                 assert audio_tensor.numel() > 0
 
