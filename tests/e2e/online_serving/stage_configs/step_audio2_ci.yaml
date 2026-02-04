@@ -14,13 +14,14 @@ stage_args:
       model_arch: StepAudio2ThinkerForConditionalGeneration
       tensor_parallel_size: 1
       hf_overrides:
-        architectures: ["Qwen2ForCausalLM"]
+          architectures: ["StepAudio2ThinkerForConditionalGeneration"]
+
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      max_model_len: 4096
-      max_num_batched_tokens: 4096
+      max_model_len: 1024
+      max_num_batched_tokens: 1024
       max_num_seqs: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.7
       skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
@@ -41,18 +42,21 @@ stage_args:
   - stage_id: 1
     runtime:
       process: true
-      devices: "1"
+      devices: "0"
       max_batch_size: 1
     engine_args:
+         
       model_stage: token2wav
       model_arch: StepAudio2Token2WavModel
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.3
+      hf_overrides:
+          architectures: ["StepAudio2Token2WavModel"]
+      gpu_memory_utilization: 0.2
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
-      max_num_batched_tokens: 4096
+      max_num_batched_tokens: 1024
       engine_output_type: audio  # Output waveform
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.step_audio2.thinker2token2wav

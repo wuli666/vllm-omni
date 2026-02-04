@@ -1,6 +1,7 @@
 import io
 import os
 from collections.abc import Iterable
+from typing import Any
 
 import onnxruntime
 import s3tokenizer
@@ -246,7 +247,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         additional: dict | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor | bytes:
         """
         Forward pass for Token2Wav
