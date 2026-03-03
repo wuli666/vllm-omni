@@ -7,12 +7,86 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_TOKEN_CONFIG,
 )
 
 logger = init_logger(__name__)
+
+
+def _ensure_list(x):
+    """Convert ConstantList / tensor-like to Python list."""
+    if hasattr(x, "_x"):
+        return list(x._x)
+    elif not isinstance(x, list):
+        return x
+    return list(x)
+
+
+# =========================
+# Async chunk processor
+# =========================
+
+
+def thinker2token2wav_async_chunk(
+    connector: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """
+    Async chunk processor: stream audio tokens from Thinker to Token2Wav.
+
+    Unlike Qwen3-Omni which passes hidden states via pooling_output,
+    Step Audio2 generates audio tokens as part of the LLM autoregressive
+    output (token IDs >= audio_start). This processor extracts those audio
+    tokens from the running token stream and sends them in chunks.
+
+    Args:
+        connector: Shared connector object with per-request state buffers.
+        pooling_output: Pooler output dict (unused — audio tokens are in
+            the token ID stream, not in hidden states).
+        request: Current engine request with access to all_token_ids.
+
+    Returns:
+        dict with "audio_tokens" (list[int]) and "finished" (torch.bool),
+        or None if the chunk is not yet full and generation is ongoing.
+    """
+    audio_start = DEFAULT_TOKEN_CONFIG.audio_start
+    audio_eos = DEFAULT_TOKEN_CONFIG.audio_eos
+
+    # Get all token IDs generated so far (prompt + decode)
+    all_token_ids = _ensure_list(request.all_token_ids)
+
+    # Extract audio tokens and convert to 0-based IDs for Token2Wav
+    audio_tokens = [tid - audio_start for tid in all_token_ids if tid >= audio_start]
+    # Remove padding / EOS tokens
+    audio_tokens = [t for t in audio_tokens if t < audio_eos]
+
+    # Determine how many audio tokens we've already sent.
+    # We use the connector's defaultdict(list) buffer to track sent tokens;
+    # len() gives the count of previously sent tokens.
+    request_id = request.external_req_id
+    already_sent = len(connector.code_prompt_token_ids[request_id])
+    new_tokens = audio_tokens[already_sent:]
+
+    chunk_size = 25
+    if len(new_tokens) < chunk_size and not request.is_finished():
+        # Not enough new tokens for a chunk yet, wait for more
+        return None
+
+    if not new_tokens and not request.is_finished():
+        return None
+
+    # Record the tokens we're about to send
+    connector.code_prompt_token_ids[request_id].extend(new_tokens)
+
+    info = {
+        "audio_tokens": new_tokens,
+        "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
+    }
+    return info
 
 
 def thinker2token2wav(
