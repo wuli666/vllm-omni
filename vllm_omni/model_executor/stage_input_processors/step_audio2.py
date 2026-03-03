@@ -31,9 +31,10 @@ def _ensure_list(x):
 
 
 def thinker2token2wav_async_chunk(
-    connector: Any,
+    transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
+    is_finished: bool = False,
 ) -> dict[str, Any] | None:
     """
     Async chunk processor: stream audio tokens from Thinker to Token2Wav.
@@ -43,18 +44,34 @@ def thinker2token2wav_async_chunk(
     output (token IDs >= audio_start). This processor extracts those audio
     tokens from the running token stream and sends them in chunks.
 
+    The flow model's conformer encoder requires ``pre_lookahead_len`` extra
+    tokens beyond the chunk boundary.  Each chunk therefore contains
+    ``chunk_size + pre_lookahead_len`` tokens, but the consumed pointer
+    only advances by ``chunk_size`` so the lookahead tokens are re-used as
+    the start of the next chunk's context (cached inside the encoder).
+
+    Payload adapts to the framework's ``_poll_single_request`` non-AR path:
+    - ``code_predictor_codes`` → ``request.prompt_token_ids`` → ``input_ids``
+    - ``left_context_size``   → ``request.additional_information``
+      → ``runtime_additional_information`` (encodes ``last_chunk`` flag:
+      0 = not last, 1 = last)
+    - ``finished``            → marks request as finished in adapter
+
     Args:
-        connector: Shared connector object with per-request state buffers.
+        transfer_manager: OmniChunkTransferAdapter instance (has
+            ``code_prompt_token_ids`` defaultdict for state tracking).
         pooling_output: Pooler output dict (unused — audio tokens are in
             the token ID stream, not in hidden states).
         request: Current engine request with access to all_token_ids.
+        is_finished: Whether the upstream request has finished generating.
 
     Returns:
-        dict with "audio_tokens" (list[int]) and "finished" (torch.bool),
-        or None if the chunk is not yet full and generation is ongoing.
+        dict with framework-compatible fields, or None if the chunk is
+        not yet ready.
     """
     audio_start = DEFAULT_TOKEN_CONFIG.audio_start
     audio_eos = DEFAULT_TOKEN_CONFIG.audio_eos
+    finished = bool(is_finished or request.is_finished())
 
     # Get all token IDs generated so far (prompt + decode)
     all_token_ids = _ensure_list(request.all_token_ids)
@@ -64,29 +81,44 @@ def thinker2token2wav_async_chunk(
     # Remove padding / EOS tokens
     audio_tokens = [t for t in audio_tokens if t < audio_eos]
 
-    # Determine how many audio tokens we've already sent.
-    # We use the connector's defaultdict(list) buffer to track sent tokens;
-    # len() gives the count of previously sent tokens.
-    request_id = request.external_req_id
-    already_sent = len(connector.code_prompt_token_ids[request_id])
-    new_tokens = audio_tokens[already_sent:]
-
+    # Flow model streaming parameters
     chunk_size = 25
-    if len(new_tokens) < chunk_size and not request.is_finished():
-        # Not enough new tokens for a chunk yet, wait for more
-        return None
+    pre_lookahead_len = 3
 
-    if not new_tokens and not request.is_finished():
-        return None
+    # consumed = number of tokens whose mel output has been produced.
+    # We track this via transfer_manager.code_prompt_token_ids[request_id].
+    request_id = request.external_req_id
+    consumed = len(transfer_manager.code_prompt_token_ids[request_id])
+    available = len(audio_tokens) - consumed
 
-    # Record the tokens we're about to send
-    connector.code_prompt_token_ids[request_id].extend(new_tokens)
-
-    info = {
-        "audio_tokens": new_tokens,
-        "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
-    }
-    return info
+    if finished:
+        # Last chunk: send all remaining tokens
+        if available <= 0:
+            # No audio tokens at all (text-only response) — send EOF marker
+            return {
+                "code_predictor_codes": [],
+                "finished": torch.tensor(True, dtype=torch.bool),
+            }
+        remaining_tokens = audio_tokens[consumed:]
+        transfer_manager.code_prompt_token_ids[request_id].extend(remaining_tokens)
+        return {
+            "code_predictor_codes": remaining_tokens,
+            "left_context_size": 1,  # 1 = last_chunk
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+    else:
+        # Non-last chunk: need chunk_size + pre_lookahead_len tokens
+        required = chunk_size + pre_lookahead_len
+        if available < required:
+            return None
+        chunk_tokens = audio_tokens[consumed : consumed + required]
+        # Only consume chunk_size tokens; the lookahead portion is re-used
+        transfer_manager.code_prompt_token_ids[request_id].extend(audio_tokens[consumed : consumed + chunk_size])
+        return {
+            "code_predictor_codes": chunk_tokens,
+            "left_context_size": 0,  # 0 = not last_chunk
+            "finished": torch.tensor(False, dtype=torch.bool),
+        }
 
 
 def thinker2token2wav(
