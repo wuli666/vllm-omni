@@ -11,13 +11,13 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -210,7 +210,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             self.image_encoder = None
 
         # VAE
-        self.vae = AutoencoderKLWan.from_pretrained(
+        self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
@@ -354,6 +354,11 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+        if boundary_ratio is None:
+            boundary_ratio = 0.875
+            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
+
         # Validate inputs
         self.check_inputs(
             prompt=prompt,
@@ -364,7 +369,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             image_embeds=image_embeds,
-            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
+            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+            boundary_ratio=boundary_ratio,
         )
 
         # Adjust num_frames to be compatible with VAE temporal scaling
@@ -417,8 +423,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         self._num_timesteps = len(timesteps)
 
         boundary_timestep = None
-        if self.boundary_ratio is not None:
-            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
+        if boundary_ratio is not None:
+            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels
@@ -752,6 +758,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         negative_prompt_embeds=None,
         image_embeds=None,
         guidance_scale_2=None,
+        boundary_ratio=None,
     ):
         if image is None and image_embeds is None:
             raise ValueError("Provide either `image` or `image_embeds`. Cannot leave both undefined.")
@@ -773,7 +780,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         if prompt is None and prompt_embeds is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
 
-        if self.boundary_ratio is None and guidance_scale_2 is not None:
+        if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

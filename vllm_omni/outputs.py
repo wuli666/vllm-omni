@@ -124,11 +124,20 @@ class OmniRequestOutput:
     def multimodal_output(self) -> dict[str, Any]:
         """Return multimodal output from the underlying request output or local field.
 
-        For pipeline outputs, this proxies to request_output.multimodal_output.
+        For pipeline outputs, this checks completion outputs first, then request_output.
         For diffusion outputs, this returns the local _multimodal_output field.
         """
-        if self.request_output is not None:
-            return getattr(self.request_output, "multimodal_output", {})
+        if self.request_output is None:
+            return self._multimodal_output
+
+        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
+        for req_out in request_outputs:
+            # Check completion outputs first (where multimodal_output is attached)
+            for output in getattr(req_out, "outputs", []):
+                if mm := getattr(output, "multimodal_output", None):
+                    return mm
+            if mm := getattr(req_out, "multimodal_output", None):
+                return mm
         return self._multimodal_output
 
     @property

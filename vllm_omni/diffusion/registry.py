@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
@@ -85,15 +86,30 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image_3",
+        "pipeline_hunyuan_image_3",
+        "HunyuanImage3Pipeline",
+    ),
     "Flux2KleinPipeline": (
         "flux2_klein",
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "NextStep11Pipeline": (
+        "nextstep_1_1",
+        "pipeline_nextstep_1_1",
+        "NextStep11Pipeline",
+    ),
     "FluxPipeline": (
         "flux",
         "pipeline_flux",
         "FluxPipeline",
+    ),
+    "OmniGen2Pipeline": (
+        "omnigen2",
+        "pipeline_omnigen2",
+        "OmniGen2Pipeline",
     ),
 }
 
@@ -107,6 +123,11 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+_NO_CACHE_ACCELERATION = {
+    # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "NextStep11Pipeline",
+}
 
 
 def initialize_model(
@@ -132,11 +153,30 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
+
+        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
+        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if vae_pp_size > 1 and not is_distributed_vae:
+            logger.warning(
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
+                vae_pp_size,
+                od_config.model_class_name,
+            )
+        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            od_config.vae_use_tiling = True
+
         # Configure VAE memory optimization settings from config
         if hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
+        if is_distributed_vae:
+            model.vae.set_parallel_size(vae_pp_size)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -232,7 +272,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -246,6 +288,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
 }
 
 

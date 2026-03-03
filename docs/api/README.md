@@ -7,23 +7,18 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-- [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
-- [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
-- [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
-- [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageRequestMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageStats][]
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni.OmniBase][]
 - [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
 - [vllm_omni.entrypoints.stage_utils.OmniStageTaskType][]
+- [vllm_omni.entrypoints.zmq_utils.ZmqQueue][]
 
 ## Inputs
 
@@ -34,7 +29,6 @@ Input data structures for multi-modal inputs.
 - [vllm_omni.inputs.data.OmniTextPrompt][]
 - [vllm_omni.inputs.data.OmniTokenInputs][]
 - [vllm_omni.inputs.data.OmniTokensPrompt][]
-- [vllm_omni.inputs.parse.parse_singleton_prompt_omni][]
 - [vllm_omni.inputs.preprocess.OmniInputPreprocessor][]
 
 ## Engine
@@ -42,6 +36,12 @@ Input data structures for multi-modal inputs.
 Engine classes for offline and online inference.
 
 - [vllm_omni.diffusion.diffusion_engine.DiffusionEngine][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.BufferAllocator][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.ManagedBuffer][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.MooncakeAgentMetadata][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.MooncakeTransferEngineConnector][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.QueryRequest][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.QueryResponse][]
 - [vllm_omni.engine.AdditionalInformationEntry][]
 - [vllm_omni.engine.AdditionalInformationPayload][]
 - [vllm_omni.engine.OmniEngineCoreOutput][]
@@ -78,6 +78,8 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioTokenizerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSSpeakerEncoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerCodePredictorConfig][]
@@ -95,8 +97,10 @@ Configuration classes.
 Worker classes and model runners for distributed inference.
 
 - [vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner][]
+- [vllm_omni.diffusion.worker.diffusion_worker.CustomPipelineWorkerExtension][]
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
+- [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]
 - [vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker][]
@@ -107,10 +111,12 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker][]
 - [vllm_omni.platforms.xpu.worker.xpu_generation_model_runner.XPUGenerationModelRunner][]
 - [vllm_omni.platforms.xpu.worker.xpu_generation_worker.XPUGenerationWorker][]
+- [vllm_omni.worker.base.OmniGPUWorkerBase][]
 - [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
+- [vllm_omni.worker.gpu_memory_utils.parse_cuda_visible_devices][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
 - [vllm_omni.worker.mixins.OmniWorkerMixin][]

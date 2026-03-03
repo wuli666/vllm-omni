@@ -50,7 +50,10 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
     cudagraph_stats: Any
+    # OMNI: multimodal_outputs field for omni-specific multimodal handling
     multimodal_outputs: Any
+    # slot_mappings for attention/drafter (aligned with upstream v1 API)
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner):
@@ -189,15 +192,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
-            logger.debug(
-                "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                "should_ubatch: %s, num_tokens_across_dp: %s",
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-            )
-
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
@@ -206,12 +200,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
-            )
-
-            logger.debug(
-                "ubatch_slices: %s, ubatch_slices_padded: %s",
-                ubatch_slices,
-                ubatch_slices_padded,
             )
 
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
@@ -305,15 +293,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-            if multimodal_outputs is not None:
-                keys_or_type = (
-                    list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
-                    else type(multimodal_outputs)
-                )
-                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
-            else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -386,6 +365,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: pass slot_mappings for drafter
         )
         self.kv_connector_output = kv_connector_output
 
@@ -428,12 +408,21 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
+
+        # Correct padding values of prompt_token_ids to match the logits vocabulary size
+        if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
+            smd = self.input_batch.sampling_metadata
+            if smd.prompt_token_ids is not None:
+                logits_vocab = logits.shape[-1]
+                if self.input_batch.vocab_size > logits_vocab:
+                    smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -454,6 +443,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -608,7 +598,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not req_state:
             return req_id
 
-        add_info = getattr(req_state, "additional_information_cpu", {}) or {}
+        add_info = self.model_intermediate_buffer.get(req_id, {})
         global_id = add_info.get("global_request_id")
         if global_id:
             if isinstance(global_id, list) and global_id:
