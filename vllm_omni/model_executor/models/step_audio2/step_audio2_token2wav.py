@@ -1,11 +1,14 @@
 import io
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
+import librosa
 import numpy as np
 import onnxruntime
 import s3tokenizer
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torchaudio
@@ -24,8 +27,10 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
+    DEFAULT_STREAM_CONFIG,
     DEFAULT_TOKEN2WAV_CONFIG,
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
+    STREAM_SOURCE_CACHE_LEN,
 )
 
 logger = init_logger(__name__)
@@ -49,6 +54,16 @@ def fade_in_out(
         + fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
     )
     return fade_in_mel
+
+
+@dataclass
+class _StreamState:
+    """Per-request streaming state for concurrent Token2Wav sessions."""
+
+    setup_done: bool = False
+    stream_cache: dict | None = None
+    hift_cache_dict: dict = field(default_factory=dict)
+    finished: bool = False
 
 
 class StepAudio2Token2WavCore(nn.Module):
@@ -75,9 +90,9 @@ class StepAudio2Token2WavCore(nn.Module):
 
         self.cache = {}
 
-        # Streaming state
-        self.mel_cache_len = 8  # hard-coded, 160ms of mel frames
-        self.source_cache_len = int(self.mel_cache_len * 480)  # 50hz mel → 24kHz wave
+        # Streaming state (constants from centralised config)
+        self.mel_cache_len = DEFAULT_STREAM_CONFIG.mel_cache_len
+        self.source_cache_len = STREAM_SOURCE_CACHE_LEN
         self.speech_window: torch.Tensor | None = None  # created lazily on device
         self.stream_cache: dict | None = None  # flow model causal cache
         self.hift_cache_dict: dict = {}  # HiFT vocoder overlap cache
@@ -150,7 +165,16 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
-        audio = s3tokenizer.load_audio(prompt_wav, sr=16000)  # [T]
+        # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
+        try:
+            audio_np, sample_rate = sf.read(prompt_wav, dtype="float32", always_2d=False)
+        except Exception:
+            audio_np, sample_rate = librosa.load(prompt_wav, sr=None, mono=True)
+        if isinstance(audio_np, np.ndarray) and audio_np.ndim > 1:
+            audio_np = np.mean(audio_np, axis=-1)
+        if int(sample_rate) != 16000:
+            audio_np = librosa.resample(y=audio_np.astype(np.float32), orig_sr=int(sample_rate), target_sr=16000)
+        audio = torch.from_numpy(audio_np.astype(np.float32))
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
@@ -164,11 +188,11 @@ class StepAudio2Token2WavCore(nn.Module):
             device=self.device,
         )
 
-        audio, sample_rate = torchaudio.load(prompt_wav, backend="soundfile")
-        audio = audio.mean(dim=0, keepdim=True)  # [1, T]
-        if sample_rate != 24000:
-            audio = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=24000)(audio)
-        prompt_mel = mel_spectrogram(audio).transpose(1, 2).squeeze(0)  # [T, num_mels]
+        audio_24k = audio_np.astype(np.float32)
+        if int(sample_rate) != 24000:
+            audio_24k = librosa.resample(y=audio_24k, orig_sr=int(sample_rate), target_sr=24000)
+        audio_24k_t = torch.from_numpy(audio_24k.astype(np.float32)).unsqueeze(0)  # [1, T]
+        prompt_mel = mel_spectrogram(audio_24k_t).transpose(1, 2).squeeze(0)  # [T, num_mels]
         prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
         prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
         prompt_mels = torch.nn.functional.pad(
@@ -340,6 +364,109 @@ class StepAudio2Token2WavCore(nn.Module):
         self.stream_cache = None
         self.hift_cache_dict = {}
 
+    # ------------------------------------------------------------------
+    # Per-request streaming (does NOT mutate self – uses external state)
+    # ------------------------------------------------------------------
+
+    def setup_stream_for(self, prompt_wav: str, state: _StreamState) -> None:
+        """Initialise flow + HiFT caches into *state* (no self mutation)."""
+        if prompt_wav not in self.cache:
+            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
+        prompt_speech_tokens, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
+
+        if self.speech_window is None or self.speech_window.device != self.device:
+            self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).to(
+                device=self.device, dtype=torch.float32
+            )
+
+        pre_lookahead = DEFAULT_STREAM_CONFIG.pre_lookahead_len
+        state.stream_cache = self.flow.setup_cache(
+            torch.cat(
+                [prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]],
+                dim=1,
+            ),
+            prompt_mels,
+            spk_emb,
+            n_timesteps=self.n_timesteps,
+        )
+        state.hift_cache_dict = {
+            "mel": torch.zeros(1, prompt_mels.shape[2], 0, device=self.device),
+            "source": torch.zeros(1, 1, 0, device=self.device),
+            "speech": torch.zeros(1, 0, device=self.device),
+        }
+        state.setup_done = True
+
+    def stream_chunk_for(
+        self,
+        audio_tokens: list[int],
+        prompt_wav: str,
+        last_chunk: bool,
+        state: _StreamState,
+    ) -> torch.Tensor:
+        """Process one chunk using *state* (no self mutation except speech_window)."""
+        if state.stream_cache is None:
+            raise ValueError("stream_cache not initialised – call setup_stream_for() first")
+
+        if prompt_wav not in self.cache:
+            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
+        _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
+
+        token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
+
+        with torch.amp.autocast(
+            str(self.device.type),
+            dtype=torch.float16 if self.float16 else torch.float32,
+        ):
+            chunk_mel, state.stream_cache = self.flow.inference_chunk(
+                token=token_tensor,
+                spk=spk_emb,
+                cache=state.stream_cache,
+                last_chunk=last_chunk,
+                n_timesteps=self.n_timesteps,
+            )
+
+        # Trim estimator attention cache to avoid unbounded growth
+        keep = DEFAULT_STREAM_CONFIG.estimator_cache_keep
+        est_att = state.stream_cache.get("estimator_att_cache")
+        if est_att is not None and est_att.shape[4] > (prompt_mels.shape[1] + keep):
+            state.stream_cache["estimator_att_cache"] = torch.cat(
+                [
+                    est_att[:, :, :, :, : prompt_mels.shape[1]],
+                    est_att[:, :, :, :, -keep:],
+                ],
+                dim=4,
+            )
+
+        # ---- HiFT vocoder with overlap-add ----
+        hift_cache_mel = state.hift_cache_dict["mel"]
+        hift_cache_source = state.hift_cache_dict["source"]
+        hift_cache_speech = state.hift_cache_dict["speech"]
+
+        mel = torch.cat([hift_cache_mel, chunk_mel], dim=2)
+        speech, source = self.hift(mel, hift_cache_source)
+
+        if hift_cache_speech.shape[-1] > 0:
+            speech = fade_in_out(speech, hift_cache_speech, self.speech_window)
+
+        state.hift_cache_dict = {
+            "mel": mel[..., -self.mel_cache_len :].clone().detach(),
+            "source": source[:, :, -self.source_cache_len :].clone().detach(),
+            "speech": speech[:, -self.source_cache_len :].clone().detach(),
+        }
+
+        if not last_chunk:
+            speech = speech[:, : -self.source_cache_len]
+
+        return speech.squeeze(0)
+
+    @staticmethod
+    def reset_stream_for(state: _StreamState) -> None:
+        """Clear streaming caches for the given state."""
+        state.stream_cache = None
+        state.hift_cache_dict = {}
+        state.setup_done = False
+        state.finished = True
+
 
 class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
     """vLLM-compatible wrapper for Step-Audio2 Token2Wav"""
@@ -373,8 +500,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         # runtime_additional_information on every forward step.
         self.enable_update_additional_information = True
 
-        self._stream_setup_done = False
-        self._stream_chunk_count = 0  # monotonic counter to detect new sessions
+        # Per-request streaming states (ordered list matching batch order).
+        self._stream_states: list[_StreamState] = []
 
         self.make_empty_intermediate_tensors = lambda: None
 
@@ -422,10 +549,14 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             OmniOutput with waveform tensor
         """
         # ----- async_chunk streaming path -----
-        # Detected by the presence of runtime_additional_information which
-        # carries ``left_context_size`` (encoding the last_chunk flag).
-        if runtime_additional_information:
-            return self._forward_async_chunk(input_ids, runtime_additional_information)
+        # Only enter when at least one entry carries the async_chunk metadata
+        # key ``left_context_size``.  The runner always passes
+        # runtime_additional_information (possibly [{}]), so a bare truthiness
+        # check would incorrectly enter this branch in synchronous mode.
+        if runtime_additional_information and any(
+            "left_context_size" in info for info in runtime_additional_information
+        ):
+            return self._forward_async_chunk(input_ids, runtime_additional_information, **kwargs)
 
         # ----- profiling / warmup guard -----
         if isinstance(input_ids, torch.Tensor):
@@ -480,61 +611,77 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         runtime_additional_information: list[dict[str, Any]],
+        **kwargs: Any,
     ) -> OmniOutput:
-        """Handle one async_chunk forward step.
+        """Handle one async_chunk forward step (batch=1 only).
 
-        Audio tokens arrive via ``input_ids`` (from
-        ``code_predictor_codes`` in the payload).  The ``last_chunk``
-        flag is encoded in ``left_context_size`` (0 = not last, 1 = last)
-        inside ``runtime_additional_information``.
+        Audio tokens arrive via ``input_ids``.  The ``last_chunk`` flag is
+        encoded in ``left_context_size`` (0 = not last, 1 = last) inside
+        ``runtime_additional_information[0]``.
+
+        Batch > 1 requires stable per-request IDs (``batch_req_ids``) from
+        the framework to bind streaming caches.  Until that is available,
+        only batch=1 is supported.
         """
-        # Extract audio tokens from input_ids
-        if isinstance(input_ids, torch.Tensor):
-            if input_ids.dim() == 1:
-                audio_tokens = input_ids.cpu().tolist()
-            else:
-                audio_tokens = input_ids[0].cpu().tolist()
-        else:
-            audio_tokens = list(input_ids) if not isinstance(input_ids, list) else input_ids
+        # --- batch=1 guard ---
+        batch_size = sum(1 for info in runtime_additional_information if "left_context_size" in info)
+        if batch_size != 1:
+            raise RuntimeError(
+                f"Token2Wav async_chunk only supports batch=1, got {batch_size}. "
+                "Batch>1 requires framework support for batch_req_ids."
+            )
 
-        # Extract last_chunk flag from left_context_size
-        info = runtime_additional_information[0] if runtime_additional_information else {}
+        info = next(info for info in runtime_additional_information if "left_context_size" in info)
         last_chunk = info.get("left_context_size", 0) == 1
 
+        # --- Manage single stream state ---
+        if not self._stream_states or self._stream_states[0].finished:
+            self._stream_states = [_StreamState()]
+        state = self._stream_states[0]
+
+        # --- Extract audio tokens ---
+        audio_tokens = input_ids.flatten().cpu().tolist()
+
+        # Empty chunk (e.g. EOF with no audio tokens)
         if not audio_tokens:
-            # Empty chunk (e.g. EOF marker with no tokens) — clean up
-            # any stale streaming state and return dummy output.
-            if self._stream_setup_done:
-                self.token2wav.reset_stream()
-                self._stream_setup_done = False
-            dummy = torch.zeros(1, dtype=torch.float32)
+            if state.setup_done:
+                self.token2wav.reset_stream_for(state)
+            else:
+                state.finished = True
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": dummy},
+                multimodal_outputs={"model_outputs": [torch.zeros(1, dtype=torch.float32)]},
             )
 
         prompt_wav = os.environ.get("STEP_AUDIO2_DEFAULT_PROMPT_WAV", STEP_AUDIO2_DEFAULT_PROMPT_WAV)
         if not os.path.exists(prompt_wav):
             raise FileNotFoundError(f"Token2Wav: prompt_wav file not found: {prompt_wav}")
 
-        # First chunk → initialise the streaming caches
-        if not self._stream_setup_done:
-            logger.info("Token2Wav: initialising streaming caches")
-            self.token2wav.setup_stream(prompt_wav)
-            self._stream_setup_done = True
+        try:
+            if not state.setup_done:
+                logger.info("Token2Wav: initialising streaming caches")
+                self.token2wav.setup_stream_for(prompt_wav, state)
 
-        # Synthesise this chunk
-        waveform = self.token2wav.stream_chunk(audio_tokens, prompt_wav=prompt_wav, last_chunk=last_chunk)
+            waveform = self.token2wav.stream_chunk_for(
+                audio_tokens,
+                prompt_wav=prompt_wav,
+                last_chunk=last_chunk,
+                state=state,
+            )
+        except Exception:
+            logger.exception("Token2Wav: stream error, resetting state")
+            self.token2wav.reset_stream_for(state)
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [torch.zeros(1, dtype=torch.float32)]},
+            )
 
-        # Clean up after the final chunk
         if last_chunk:
-            self.token2wav.reset_stream()
-            self._stream_setup_done = False
+            self.token2wav.reset_stream_for(state)
 
-        waveform_cpu = waveform.detach().cpu().contiguous()
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": waveform_cpu},
+            multimodal_outputs={"model_outputs": [waveform.detach().cpu().contiguous()]},
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

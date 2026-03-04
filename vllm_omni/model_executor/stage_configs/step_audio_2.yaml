@@ -93,6 +93,7 @@ stage_args:
       gpu_memory_utilization: 0.3  # Token2Wav needs less memory
       enforce_eager: true
       trust_remote_code: true
+      async_scheduling: false
       enable_prefix_caching: false
       max_num_batched_tokens: 4096
       engine_output_type: audio    # Outputs waveform

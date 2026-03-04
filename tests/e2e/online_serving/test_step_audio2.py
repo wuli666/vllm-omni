@@ -19,7 +19,7 @@ from pathlib import Path
 import aiohttp
 import numpy as np
 import pytest
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
 STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "step_audio2_ci.yaml")

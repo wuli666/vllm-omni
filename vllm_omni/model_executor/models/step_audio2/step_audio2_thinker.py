@@ -427,6 +427,14 @@ class StepAudio2ProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         return StepAudio2Processor(self.get_tokenizer())
 
+    def build_data_parser(self) -> MultiModalDataParser:
+        return MultiModalDataParser(target_sr=16000)
+
+    # Backward/branch compatibility:
+    # some code paths still call get_data_parser() on ProcessingInfo.
+    def get_data_parser(self) -> MultiModalDataParser:
+        return MultiModalDataParser(target_sr=16000)
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None}
 
@@ -459,9 +467,6 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
 
 class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2ProcessingInfo]):
     """Multi-modal processor for Step-Audio2"""
-
-    def _get_data_parser(self) -> MultiModalDataParser:
-        return MultiModalDataParser(target_sr=16000)
 
     def _get_mm_fields_config(
         self,

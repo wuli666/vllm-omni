@@ -87,6 +87,29 @@ class StepAudio2Token2WavConfig:
 
 
 @dataclass(frozen=True)
+class StepAudio2StreamConfig:
+    """Streaming (chunked) inference configuration for Token2Wav."""
+
+    chunk_size: int = 25
+    """Number of audio tokens consumed per chunk."""
+
+    pre_lookahead_len: int = 3
+    """Conformer encoder lookahead tokens beyond the chunk boundary."""
+
+    up_rate: int = 2
+    """Token-to-mel upsampling rate inside the flow model."""
+
+    mel_cache_len: int = 8
+    """HiFT overlap mel frames (160 ms at 50 Hz mel rate)."""
+
+    n_timesteps: int = 10
+    """Flow model ODE solver steps."""
+
+    estimator_cache_keep: int = 100
+    """Attention-cache pruning window for the flow estimator."""
+
+
+@dataclass(frozen=True)
 class StepAudio2ModelConfig:
     """
     Step-Audio2 complete model configuration - Single Source of Truth.
@@ -120,7 +143,10 @@ class StepAudio2ModelConfig:
 DEFAULT_TOKEN_CONFIG = StepAudio2TokenConfig()
 DEFAULT_ENCODER_CONFIG = StepAudio2EncoderConfig()
 DEFAULT_TOKEN2WAV_CONFIG = StepAudio2Token2WavConfig()
+DEFAULT_STREAM_CONFIG = StepAudio2StreamConfig()
 DEFAULT_MODEL_CONFIG = StepAudio2ModelConfig()
+
+STREAM_SOURCE_CACHE_LEN = DEFAULT_STREAM_CONFIG.mel_cache_len * 480  # 3840 samples
 
 # Export constants for backward compatibility
 STEP_AUDIO2_TEXT_MAX = DEFAULT_TOKEN_CONFIG.text_max
@@ -138,11 +164,14 @@ __all__ = [
     "StepAudio2TokenConfig",
     "StepAudio2EncoderConfig",
     "StepAudio2Token2WavConfig",
+    "StepAudio2StreamConfig",
     "StepAudio2ModelConfig",
     "DEFAULT_TOKEN_CONFIG",
     "DEFAULT_ENCODER_CONFIG",
     "DEFAULT_TOKEN2WAV_CONFIG",
+    "DEFAULT_STREAM_CONFIG",
     "DEFAULT_MODEL_CONFIG",
+    "STREAM_SOURCE_CACHE_LEN",
     "STEP_AUDIO2_TEXT_MAX",
     "STEP_AUDIO2_AUDIO_START",
     "STEP_AUDIO2_AUDIO_VOCAB_SIZE",

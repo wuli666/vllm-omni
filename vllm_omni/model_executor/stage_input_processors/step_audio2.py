@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
+    DEFAULT_STREAM_CONFIG,
     DEFAULT_TOKEN_CONFIG,
 )
 
@@ -17,11 +18,13 @@ logger = init_logger(__name__)
 
 
 def _ensure_list(x):
-    """Convert ConstantList / tensor-like to Python list."""
+    """Convert ConstantList / tensor / iterable to Python list."""
     if hasattr(x, "_x"):
         return list(x._x)
+    elif isinstance(x, torch.Tensor):
+        return x.tolist()
     elif not isinstance(x, list):
-        return x
+        return list(x) if hasattr(x, "__iter__") else [x]
     return list(x)
 
 
@@ -73,17 +76,20 @@ def thinker2token2wav_async_chunk(
     audio_eos = DEFAULT_TOKEN_CONFIG.audio_eos
     finished = bool(is_finished or request.is_finished())
 
-    # Get all token IDs generated so far (prompt + decode)
+    # Only look at decode (generated) tokens — the prompt may contain
+    # historical audio tokens from prior conversation turns.
     all_token_ids = _ensure_list(request.all_token_ids)
+    prompt_len = len(_ensure_list(request.prompt_token_ids))
+    generated_ids = all_token_ids[prompt_len:]
 
     # Extract audio tokens and convert to 0-based IDs for Token2Wav
-    audio_tokens = [tid - audio_start for tid in all_token_ids if tid >= audio_start]
+    audio_tokens = [tid - audio_start for tid in generated_ids if tid >= audio_start]
     # Remove padding / EOS tokens
     audio_tokens = [t for t in audio_tokens if t < audio_eos]
 
-    # Flow model streaming parameters
-    chunk_size = 25
-    pre_lookahead_len = 3
+    # Flow model streaming parameters (from centralised config)
+    chunk_size = DEFAULT_STREAM_CONFIG.chunk_size
+    pre_lookahead_len = DEFAULT_STREAM_CONFIG.pre_lookahead_len
 
     # consumed = number of tokens whose mel output has been produced.
     # We track this via transfer_manager.code_prompt_token_ids[request_id].
@@ -97,6 +103,7 @@ def thinker2token2wav_async_chunk(
             # No audio tokens at all (text-only response) — send EOF marker
             return {
                 "code_predictor_codes": [],
+                "left_context_size": 1,  # signal last_chunk=True
                 "finished": torch.tensor(True, dtype=torch.bool),
             }
         remaining_tokens = audio_tokens[consumed:]

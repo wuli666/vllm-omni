@@ -27,6 +27,7 @@ from typing import NamedTuple
 import librosa
 import numpy as np
 import soundfile as sf
+import torch
 from vllm.assets.audio import AudioAsset
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -358,7 +359,24 @@ def main(args):
                 if audio_tensor is not None:
                     # Save audio file
                     output_wav = os.path.join(output_dir, f"{request_id:05d}_output.wav")
-                    audio_numpy = audio_tensor.detach().cpu().numpy()
+                    if isinstance(audio_tensor, list):
+                        chunks = []
+                        for chunk in audio_tensor:
+                            if chunk is None:
+                                continue
+                            if isinstance(chunk, torch.Tensor):
+                                chunk_np = chunk.detach().cpu().numpy()
+                            else:
+                                chunk_np = np.asarray(chunk)
+                            if chunk_np.size > 0:
+                                chunks.append(chunk_np)
+                        if not chunks:
+                            continue
+                        audio_numpy = np.concatenate(chunks, axis=-1)
+                    elif isinstance(audio_tensor, torch.Tensor):
+                        audio_numpy = audio_tensor.detach().cpu().numpy()
+                    else:
+                        audio_numpy = np.asarray(audio_tensor)
                     sf.write(output_wav, audio_numpy, samplerate=24000)
 
 

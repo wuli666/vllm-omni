@@ -18,6 +18,12 @@ vllm serve stepfun-ai/Step-Audio2-mini --omni --port 8092 \
     --stage-configs-path /path/to/step_audio_2.yaml
 ```
 
+Enable async chunk (recommended for lower audio first-packet latency):
+```bash
+vllm serve stepfun-ai/Step-Audio2-mini --omni --port 8092 \
+    --stage-configs-path /hy-tmp/vllm-omni-2/vllm_omni/model_executor/stage_configs/step_audio_2_async_chunk.yaml
+```
+
 With local model:
 ```bash
 vllm serve /path/to/step-audio-2 --omni --port 8092
@@ -134,7 +140,7 @@ Step-Audio2 uses the OpenAI-compatible chat completions API:
 ## Troubleshooting
 
 ### Server not responding
-- Check if the server is running: `curl http://localhost:8092/health`
+- Check if the server is running: `curl http://localhost:8092/v1/models`
 - Verify the port number matches
 
 ### Audio not generated
