@@ -2981,15 +2981,19 @@ async def _run_video_generation_job(
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
         return
 
-    await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
     try:
+
+        async def _mark_started() -> None:
+            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request,
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=_mark_started,
         )
 
         save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
@@ -3044,13 +3048,13 @@ async def _run_video_generation_job(
         )
     except asyncio.CancelledError:
         await _cleanup_video(video_id)
-        await VIDEO_STORE.pop(video_id)
         raise
     finally:
         _cleanup_video_references(reference_video, reference_audio)
 
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+VIDEO_CANCEL_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_CANCEL_TIMEOUT", 2.0))
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -3688,16 +3692,22 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
         task = await VIDEO_TASKS.get(video_id)
         if task is not None:
-            task.cancel()
+            # AsyncOmni.generate owns propagation from CancelledError to the
+            # Orchestrator and stage engine. Repeated DELETE calls must not
+            # inject another CancelledError while that cleanup is in progress.
+            if not task.cancelling():
+                task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=2.0)
+                # wait_for(task) would cancel the task again on timeout and can
+                # interrupt AsyncOmni while it awaits the engine abort ACK.
+                await asyncio.wait_for(asyncio.shield(task), timeout=VIDEO_CANCEL_TIMEOUT_S)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
                 pass
 
-            await VIDEO_STORE.pop(video_id)
-            return VideoDeleteResponse(id=job.id, deleted=True)
+        await VIDEO_STORE.pop(video_id)
+        return VideoDeleteResponse(id=job.id, deleted=True)
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:

@@ -107,6 +107,25 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
 
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
+### Cancel and Delete
+
+```bash
+curl -X DELETE "http://localhost:8091/v1/videos/${video_id}"
+```
+
+Deleting a queued or running job propagates an abort to the generation engine
+before its metadata is removed. With step execution, a running diffusion
+request stops at the next denoise-step boundary. Request-batch execution cannot
+preempt a model `forward()` that is already running; its abort is applied when
+that forward returns. If cancellation cleanup exceeds the configured timeout,
+the endpoint returns `409` and retains the job record so deletion can be
+retried. Set `VLLM_OMNI_VIDEO_CANCEL_TIMEOUT` to change the timeout from its
+default of two seconds.
+
 ### Synchronous Response
 
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video

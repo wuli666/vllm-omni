@@ -25,6 +25,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import envs
 
+from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
@@ -52,6 +53,7 @@ class MockVideoResult:
         multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
+        custom_output=None,
     ):
         self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
@@ -60,6 +62,7 @@ class MockVideoResult:
             self.multimodal_output["audio_sample_rate"] = sample_rate
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
+        self.custom_output = custom_output or {}
 
 
 class FakeAsyncOmni:
@@ -91,6 +94,11 @@ class FakeAsyncOmni:
         ):
             self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
+        if sampling_params_list[0].emit_request_lifecycle:
+            yield MockVideoResult(
+                [],
+                custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+            )
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
 
@@ -159,14 +167,86 @@ class BlockingVideoHandler:
             self.stage_configs = stage_configs
 
     async def generate_video_bytes(
-        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
+        if on_started is not None:
+            await on_started()
         self.started.set()
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             self.cancelled.set()
+            raise
+
+
+class QueuedVideoHandler(BlockingVideoHandler):
+    def __init__(self):
+        super().__init__()
+        self.admit = threading.Event()
+        self.in_progress = threading.Event()
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
+        self.started.set()
+        try:
+            while not self.admit.is_set():
+                await asyncio.sleep(0.01)
+            if on_started is not None:
+                await on_started()
+            self.in_progress.set()
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class SlowCleanupVideoHandler(BlockingVideoHandler):
+    def __init__(self):
+        super().__init__()
+        self.release_cleanup = threading.Event()
+        self.second_cancel = threading.Event()
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
+        if on_started is not None:
+            await on_started()
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            try:
+                while not self.release_cleanup.is_set():
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                self.second_cancel.set()
+                raise
             raise
 
 
@@ -1862,6 +1942,60 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
 
     retrieve_resp = test_client.get(f"/v1/videos/{video_id}")
     assert retrieve_resp.status_code == 404
+
+
+def test_async_video_stays_queued_until_scheduler_admission(test_client):
+    handler = QueuedVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Queue this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    queued = test_client.get(f"/v1/videos/{video_id}")
+    assert queued.status_code == 200
+    assert queued.json()["status"] == VideoGenerationStatus.QUEUED.value
+
+    handler.admit.set()
+    assert handler.in_progress.wait(timeout=2.0)
+    in_progress = test_client.get(f"/v1/videos/{video_id}")
+    assert in_progress.status_code == 200
+    assert in_progress.json()["status"] == VideoGenerationStatus.IN_PROGRESS.value
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+
+
+def test_delete_timeout_does_not_recancel_generation_cleanup(test_client, monkeypatch):
+    handler = SlowCleanupVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    monkeypatch.setattr(api_server, "VIDEO_CANCEL_TIMEOUT_S", 0.05)
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Slow cleanup"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert delete_resp.status_code == 409
+    assert handler.cancelled.wait(timeout=2.0)
+    assert not handler.second_cancel.is_set()
+    assert test_client.get(f"/v1/videos/{video_id}").status_code == 200
+
+    retry_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert retry_resp.status_code == 409
+    assert not handler.second_cancel.is_set()
+
+    handler.release_cleanup.set()
+    _wait_until(lambda: asyncio.run(api_server.VIDEO_TASKS.get(video_id)) is None)
+    assert not handler.second_cancel.is_set()
+
+    # A timed-out DELETE retains metadata even after background cleanup, so a
+    # later retry can explicitly complete deletion.
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is not None
+    final_retry = test_client.delete(f"/v1/videos/{video_id}")
+    assert final_retry.status_code == 200
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
 def test_video_response_file_extension_is_robust():
