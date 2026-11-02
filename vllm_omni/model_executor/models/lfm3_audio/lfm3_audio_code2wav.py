@@ -5,9 +5,10 @@
 The codec decoder is natively streaming (``LiquidCodecStream`` per request), so
 each step decodes only the frames that arrived and returns delta audio; the
 overlap-add tail is flushed when the request finishes. Payload: ``codes.audio``
-is a ``[12, frames]`` tensor of new frames, ``meta.req_id`` names the stream and
-``meta.stream_finished`` (async chunk) or ``meta.finished`` (full payload)
-closes it.
+is a ``[12, frames]`` tensor of new frames, and ``meta.stream_finished`` (async
+chunk) or ``meta.finished`` (full payload) closes the stream. Streams are keyed
+by the scheduler's request id, so ``on_requests_finished`` also frees aborted
+requests.
 """
 
 from __future__ import annotations
@@ -49,10 +50,16 @@ def _frames(info: dict[str, Any], num_codebooks: int) -> torch.Tensor | None:
     return audio.reshape(num_codebooks, -1)
 
 
+# Checkpoint renames applied by the reference loader (``register_checkpoint_conversion_mapping``).
+_LEGACY_PREFIXES = (("_frontend.", "frontend."), ("quantizer.fsq.", "quantizer."))
+
+
 class Lfm3AudioCode2Wav(nn.Module):
     """Stage-1 model for LFM3-Audio / LFM3-Omni (GenerationModelRunner)."""
 
     input_modalities = "audio"
+    # Streams are keyed by the scheduler's request ids, the ones on_requests_finished delivers.
+    requires_request_ids = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -75,18 +82,24 @@ class Lfm3AudioCode2Wav(nn.Module):
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.codec.named_parameters()) | dict(self.codec.named_buffers())
+        state = self.codec.state_dict(keep_vars=True)
         loaded: set[str] = set()
         for name, tensor in weights:
-            target = params.get(name)
+            for old, new in _LEGACY_PREFIXES:
+                if name.startswith(old):
+                    name = new + name[len(old) :]
+            target = state.get(name)
             if target is None:
                 # The analysis half of the codec (frontend, encoder, quantizer.project_in) is unused here.
                 continue
             target.data.copy_(tensor)
-            loaded.add(f"codec.{name}")
+            loaded.add(name)
+        missing = sorted(set(state) - loaded)
+        if missing:
+            raise ValueError(f"Liquid codec checkpoint is missing {len(missing)} decoder tensors, e.g. {missing[:4]}")
         # The synthesis window and the ISTFT stay in float32, as in the reference.
         self.codec.decoder.istft.float()
-        return loaded
+        return {f"codec.{name}" for name in loaded}
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
         for req_id in finished_req_ids:
@@ -130,16 +143,21 @@ class Lfm3AudioCode2Wav(nn.Module):
         infos = runtime_additional_information or []
         seq_token_counts = kwargs.get("seq_token_counts")
         num_reqs = len(seq_token_counts) if seq_token_counts is not None else len(infos)
+        request_ids = kwargs.get("request_ids") or []
         sample_rate = torch.tensor(self.codec.sample_rate, dtype=torch.int32)
         audios: list[torch.Tensor] = []
         for index in range(num_reqs):
             info = infos[index] if index < len(infos) and isinstance(infos[index], dict) else {}
             meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
-            req_id = _first(meta.get("req_id"))
+            req_id = request_ids[index] if index < len(request_ids) else _first(meta.get("req_id"))
             frames = _frames(info, self.codec.num_codebooks)
+            # An exception here would stop the engine for every request: report and drop instead.
+            if frames is not None and bool(((frames < 0) | (frames >= self.codec.codebook_size)).any()):
+                logger.error("LFM3-Audio code2wav: request %s sent codes outside [0, 2016); frames dropped", req_id)
+                frames = None
             if not isinstance(req_id, str):
                 if frames is not None:
-                    raise ValueError("LFM3-Audio code2wav payload is missing meta.req_id")
+                    logger.error("LFM3-Audio code2wav: payload without a request id; frames dropped")
                 audios.append(torch.empty(0, dtype=torch.float32))
                 continue
             finished = _flag(meta.get("stream_finished")) or _flag(meta.get("finished"))

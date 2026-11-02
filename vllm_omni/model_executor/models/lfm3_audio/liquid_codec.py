@@ -38,6 +38,8 @@ def codec_lfm_spec(config: Any, sliding_window: int | None) -> Lfm3StackSpec:
         sandwich_norm=True,
         sliding_window=sliding_window,
         rope_theta=1_000_000.0,
+        # The reference hooks the codec's rotary embedding to stay in float32.
+        rope_table_float32=True,
     )
 
 

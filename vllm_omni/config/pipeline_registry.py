@@ -192,6 +192,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
+    # The checkpoint's model_type; text output only until speech output lands.
+    "lfm3_audio": LFM3_AUDIO_TEXT_PIPELINE,
     "lfm3_audio_text": LFM3_AUDIO_TEXT_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     # Public Ming-3.0-tts-tiny still serializes the former config name.

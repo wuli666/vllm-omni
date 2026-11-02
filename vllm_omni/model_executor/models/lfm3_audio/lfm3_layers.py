@@ -46,6 +46,9 @@ class Lfm3StackSpec:
     # encoder's stack) does neither.
     output_gate: bool = True
     rope_float32: bool = True
+    # The rotary tables are rounded to the model dtype, except in the Liquid
+    # codec, whose reference keeps them in float32.
+    rope_table_float32: bool = False
 
     @classmethod
     def from_hf(cls, config: Any, *, causal: bool = True) -> Lfm3StackSpec:
@@ -266,8 +269,9 @@ class Lfm3Stack(nn.Module):
         positions = torch.arange(offset, offset + x.shape[1], device=x.device)
         freqs = positions[:, None].float() * self.inv_freq.float()[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
-        # The reference rounds the tables to the model dtype before rotating in float32.
-        cos, sin = emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+        cos, sin = emb.cos(), emb.sin()
+        if not self.spec.rope_table_float32:
+            cos, sin = cos.to(x.dtype), sin.to(x.dtype)
         for index, layer in enumerate(self.layers):
             cache = None if state is None else state.layers.setdefault(index, {})
             x = layer(x, cos, sin, positions, cache)
