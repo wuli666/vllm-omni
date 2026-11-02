@@ -6,7 +6,8 @@ The language model runs on vLLM's paged ``Lfm3Model``. Three smaller LFM3
 stacks run outside the KV cache manager and use these layers instead:
 
 * the Liquid codec decoder: causal, sliding window 30, streamed chunk by chunk;
-* the audio encoder: sliding window attention over the mel frames;
+* the audio encoder: an LFM2 stack (no output gate, RoPE in the model dtype)
+  with causal sliding window attention over the downsampled mel frames;
 * the depth decoder: bidirectional attention over the 12 codebook slots.
 
 Parameter names match the checkpoint (``layers.N.conv.in_proj`` ...), and the
@@ -41,17 +42,30 @@ class Lfm3StackSpec:
     rope_theta: float = 1_000_000.0
     partial_rotary_factor: float = 1.0
     causal: bool = True
+    # LFM3 gates each attention head and rotates in float32; LFM2 (the audio
+    # encoder's stack) does neither.
+    output_gate: bool = True
+    rope_float32: bool = True
 
     @classmethod
     def from_hf(cls, config: Any, *, causal: bool = True) -> Lfm3StackSpec:
-        """Build from an HF ``Lfm3Config`` (or an object with the same fields)."""
+        """Build from an HF ``Lfm3Config`` or ``Lfm2Config``."""
         layer_types = tuple(config.layer_types)
         rope = getattr(config, "rope_parameters", None) or {}
         attention_type = next((t for t in layer_types if t != "conv"), None)
         rope_layer = rope.get(attention_type, rope) if attention_type else {}
+        lfm3 = getattr(config, "model_type", "lfm3") != "lfm2"
+        intermediate_size = config.intermediate_size
+        if getattr(config, "block_auto_adjust_ff_dim", False):
+            # LFM2 sizes the SwiGLU to 2/3 of intermediate_size, rounded up to block_multiple_of.
+            intermediate_size = int(2 * intermediate_size / 3)
+            if getattr(config, "block_ffn_dim_multiplier", None) is not None:
+                intermediate_size = int(config.block_ffn_dim_multiplier * intermediate_size)
+            multiple = config.block_multiple_of
+            intermediate_size = multiple * ((intermediate_size + multiple - 1) // multiple)
         return cls(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
@@ -64,6 +78,8 @@ class Lfm3StackSpec:
             rope_theta=float(rope_layer.get("rope_theta", 1_000_000.0)),
             partial_rotary_factor=float(rope_layer.get("partial_rotary_factor", 1.0)),
             causal=causal,
+            output_gate=lfm3,
+            rope_float32=lfm3,
         )
 
 
@@ -102,7 +118,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class Lfm3Attention(nn.Module):
-    """Attention with QK RMSNorm, a sigmoid output gate per head and an optional sliding window."""
+    """Attention with QK RMSNorm, an optional sigmoid output gate per head and an optional sliding window.
+
+    LFM2 checkpoints name the output projection and the QK norms ``out_proj`` /
+    ``q_layernorm`` / ``k_layernorm``; the owning model maps them on load.
+    """
 
     def __init__(self, spec: Lfm3StackSpec, sliding_window: int | None) -> None:
         super().__init__()
@@ -110,13 +130,14 @@ class Lfm3Attention(nn.Module):
         self.num_heads, self.num_kv_heads, self.head_dim = spec.num_heads, spec.num_kv_heads, d
         self.causal = spec.causal
         self.sliding_window = sliding_window
+        self.rope_float32 = spec.rope_float32
         self.q_proj = nn.Linear(h, spec.num_heads * d, bias=False)
         self.k_proj = nn.Linear(h, spec.num_kv_heads * d, bias=False)
         self.v_proj = nn.Linear(h, spec.num_kv_heads * d, bias=False)
         self.o_proj = nn.Linear(spec.num_heads * d, h, bias=False)
         self.q_norm = Lfm3RMSNorm(d, spec.norm_eps)
         self.k_norm = Lfm3RMSNorm(d, spec.norm_eps)
-        self.gate_proj = nn.Linear(h, spec.num_heads, bias=False)
+        self.gate_proj = nn.Linear(h, spec.num_heads, bias=False) if spec.output_gate else None
 
     def forward(
         self,
@@ -131,9 +152,12 @@ class Lfm3Attention(nn.Module):
         k = self.k_norm(self.k_proj(x).view(b, t, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = self.v_proj(x).view(b, t, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # cos / sin are [tokens, head_dim] and broadcast over [batch, heads, tokens, head_dim].
-        cos32, sin32 = cos.float(), sin.float()
-        q = (q.float() * cos32 + _rotate_half(q.float()) * sin32).to(x.dtype)
-        k = (k.float() * cos32 + _rotate_half(k.float()) * sin32).to(x.dtype)
+        if self.rope_float32:
+            cos32, sin32 = cos.float(), sin.float()
+            q = (q.float() * cos32 + _rotate_half(q.float()) * sin32).to(x.dtype)
+            k = (k.float() * cos32 + _rotate_half(k.float()) * sin32).to(x.dtype)
+        else:
+            q, k = q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
         key_positions = positions
         if cache is not None and "k" in cache:
@@ -156,9 +180,10 @@ class Lfm3Attention(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, scale=self.head_dim**-0.5, enable_gqa=self.num_kv_heads != self.num_heads
         )
-        gate = torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)
-        out = (out.transpose(1, 2) * gate).reshape(b, t, -1)
-        return self.o_proj(out)
+        out = out.transpose(1, 2)
+        if self.gate_proj is not None:
+            out = out * torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)
+        return self.o_proj(out.reshape(b, t, -1))
 
 
 class Lfm3ShortConv(nn.Module):

@@ -109,6 +109,11 @@ _OMNI_MODELS = {
         "audex_xcodec",
         "AudexXCodec1",
     ),
+    "Lfm3AudioForConditionalGeneration": (
+        "lfm3_audio",
+        "lfm3_audio",
+        "Lfm3AudioForConditionalGeneration",
+    ),
     "Lfm3AudioCode2Wav": (
         "lfm3_audio",
         "lfm3_audio_code2wav",
