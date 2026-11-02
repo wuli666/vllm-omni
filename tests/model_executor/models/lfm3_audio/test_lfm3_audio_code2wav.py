@@ -70,4 +70,4 @@ def test_weights_load_and_report_missing(stage):
 def test_checkpoint_model_type_resolves_a_pipeline():
     pipeline = resolve_pipeline_config("lfm3_audio")
     assert pipeline is not None
-    assert pipeline.stages[0].model_arch == "Lfm3AudioForConditionalGeneration"
+    assert [stage.model_arch for stage in pipeline.stages] == ["Lfm3AudioForConditionalGeneration", "Lfm3AudioCode2Wav"]
