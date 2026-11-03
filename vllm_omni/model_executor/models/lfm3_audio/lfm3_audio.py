@@ -17,8 +17,8 @@ is either text or a speech frame, per request (``lfm3_audio_modes``):
 * ``preprocess`` feeds the previous frame back (sum of its 12 code
   embeddings) or advances the mode machine on the sampled text token, and
   decides whether this step's slot is speech;
-* ``postprocess`` samples the frame of a speech slot with the depth decoder;
-* ``make_omni_output`` publishes the frame as ``codes.audio`` ``[12, 1]``;
+* ``make_omni_output`` samples the frames of all speech slots of the step
+  with one depth decoder pass and publishes each as ``codes.audio`` ``[12, 1]``;
 * ``compute_logits`` forces ``<|audio_out|>`` on speech slots, so the sequence
   carries one placeholder per frame, as in the reference.
 """
@@ -69,7 +69,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .lfm3_audio_depth import AudioSampling, Lfm3AudioDepthDecoder
+from .lfm3_audio_depth import AudioSampling, Lfm3AudioDepthDecoder, to_device
 from .lfm3_audio_encoder import Lfm3AudioEncoder, Lfm3AudioProjector
 from .lfm3_audio_modes import Lfm3AudioModeState, Lfm3AudioTokens
 
@@ -77,7 +77,7 @@ logger = init_logger(__name__)
 
 AUDIO_PLACEHOLDER = "<|audio|>"
 # Request-buffer keys of device tensors, kept on the GPU between steps.
-_FRAME_EMBED, _FRAME, _HISTORY = "lfm3_frame_embed", "lfm3_frame", "lfm3_history"
+_FRAME_EMBED, _HISTORY = "lfm3_frame_embed", "lfm3_history"
 _AUDIO_SAMPLING_KEYS = ("temperature", "top_k", "repetition_penalty", "repetition_window")
 # One encoder output per 8 mel frames (three stride-2 convolutions).
 ENCODER_STRIDE = 8
@@ -258,10 +258,12 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         if self.speech_output and vllm_config.speculative_config is not None:
             # Speech slots are decided, sampled and fed back one token per step.
             raise NotImplementedError("LFM3-Audio speech output does not support speculative decoding")
-        self.has_preprocess = self.has_postprocess = self.have_multimodal_outputs = self.speech_output
+        self.has_preprocess = self.have_multimodal_outputs = self.speech_output
+        # Speech frames are sampled for the whole batch at once in make_omni_output, not per request.
+        self.has_postprocess = False
         # preprocess only rewrites decode rows: prompt rows keep the encoder's speech embeddings.
         self.preprocess_keeps_mm_inputs = self.speech_output
-        self.gpu_resident_buffer_keys = {_FRAME_EMBED, _FRAME, _HISTORY}
+        self.gpu_resident_buffer_keys = {_FRAME_EMBED, _HISTORY}
         eos = config.text_config.eos_token_id
         self.tokens = Lfm3AudioTokens.from_config(config, tuple(eos) if isinstance(eos, list | tuple) else (eos,))
         self.audio_eos_code = config.audio_eos_code
@@ -310,29 +312,6 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         updates |= {"lfm3_speech_slot": state.speech_slot, "lfm3_frame_pending": False}
         return input_ids, input_embeds, updates
 
-    def postprocess(self, hidden_states: torch.Tensor, **info: Any) -> dict[str, Any]:
-        if not info.get("lfm3_speech_slot"):
-            return {"lfm3_frame_out": False}
-        sampling = self._audio_sampling(info)
-        history = info.get(_HISTORY)
-        codes = self.depth_decoder.sample_frame(hidden_states[-1], sampling, history, info.get("lfm3_generator"))
-        end_of_audio = bool((codes == self.audio_eos_code).any())
-        if end_of_audio:
-            codes = torch.full_like(codes, self.audio_eos_code)
-        elif sampling.repetition_window:
-            # ponytail: the window is re-snapshotted each frame; keep per-codebook counts if long replies get slow.
-            history = codes[None] if history is None else torch.cat((history.to(codes.device), codes[None]))
-            history = history[-sampling.repetition_window :]
-        state = Lfm3AudioModeState.from_info(info)
-        state.after_frame(end_of_audio, self.tokens)
-        return state.as_updates() | {
-            "lfm3_frame_pending": True,
-            _FRAME_EMBED: self.codebook_embedding(codes + self.codebook_offsets).sum(0),
-            _FRAME: codes,
-            "lfm3_frame_out": not end_of_audio,
-            _HISTORY: history,
-        }
-
     @staticmethod
     def _audio_sampling(info: dict[str, Any]) -> AudioSampling:
         """Defaults of the checkpoint's generation_config; ``audio_<field>`` in additional information overrides.
@@ -360,9 +339,45 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         return AudioSampling(**overrides)
 
     def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput:
+        """Sample this step's speech frames, all speech slots of the batch in one depth decoder pass.
+
+        ``model_intermediate_buffer`` holds the live request buffers in batch order: the frame state written
+        here is what the next step's ``preprocess`` reads.
+        """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         infos = kwargs.get("model_intermediate_buffer") or []
+        empty = model_outputs.new_empty((self.config.num_codebooks, 0), dtype=torch.long)
+        frames = [empty] * len(infos)
+        speech = [i for i, info in enumerate(infos) if info.get("lfm3_speech_slot")]
+        if speech:
+            spans = kwargs["request_token_spans"]
+            last = to_device([spans[i][1] - 1 for i in speech], model_outputs.device, torch.long)
+            samplings = [self._audio_sampling(infos[i]) for i in speech]
+            codes = self.depth_decoder.sample_frames(
+                model_outputs[last],
+                samplings,
+                [infos[i].get(_HISTORY) for i in speech],
+                [infos[i].get("lfm3_generator") for i in speech],
+            )
+            end_of_audio = (codes == self.audio_eos_code).any(-1)
+            codes = torch.where(end_of_audio[:, None], self.audio_eos_code, codes)
+            embeds = self.codebook_embedding(codes + self.codebook_offsets).sum(1)
+            for row, (i, sampling, eoa) in enumerate(zip(speech, samplings, end_of_audio.tolist())):
+                info, frame = infos[i], codes[row]
+                history = info.get(_HISTORY)
+                if not eoa:
+                    frames[i] = frame.reshape(-1, 1)
+                    if sampling.repetition_window:
+                        # ponytail: the window is re-snapshotted each frame; keep per-codebook counts if long
+                        # replies get slow.
+                        history = frame[None] if history is None else torch.cat((history.to(frame.device), frame[None]))
+                        history = history[-sampling.repetition_window :]
+                state = Lfm3AudioModeState.from_info(info)
+                state.after_frame(eoa, self.tokens)
+                info.update(
+                    state.as_updates(), lfm3_frame_pending=True, **{_FRAME_EMBED: embeds[row], _HISTORY: history}
+                )
         forced = [
             self.tokens.audio_out
             if info.get("lfm3_speech_slot")
@@ -371,9 +386,9 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
             else -1
             for info in infos
         ]
-        self._forced_tokens = torch.tensor(forced, device=model_outputs.device) if any(t >= 0 for t in forced) else None
-        empty = model_outputs.new_empty((self.config.num_codebooks, 0), dtype=torch.long)
-        frames = [info[_FRAME].reshape(-1, 1) if info.get("lfm3_frame_out") else empty for info in infos]
+        self._forced_tokens = (
+            to_device(forced, model_outputs.device, torch.long) if any(t >= 0 for t in forced) else None
+        )
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={"codes": {"audio": frames}})
 
     def embed_multimodal(self, **kwargs: Any) -> MultiModalEmbeddings:

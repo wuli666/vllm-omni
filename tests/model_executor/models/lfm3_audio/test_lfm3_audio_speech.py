@@ -93,18 +93,35 @@ def _tiny_depth_config() -> SimpleNamespace:
     )
 
 
-def test_depth_decoder_reveals_every_codebook():
+def test_depth_decoder_samples_each_row_as_if_alone():
     torch.manual_seed(0)
-    decoder = Lfm3AudioDepthDecoder(_tiny_depth_config()).eval()
+    decoder = Lfm3AudioDepthDecoder(_tiny_depth_config()).double().eval()
     for param in decoder.parameters():
         torch.nn.init.normal_(param, std=0.5)
-    hidden = torch.randn(48)
+    hidden = torch.randn(4, 48, dtype=torch.float64)
     greedy = AudioSampling(temperature=0.0)
-    first = decoder.sample_frame(hidden, greedy, generator=torch.Generator().manual_seed(1))
-    again = decoder.sample_frame(hidden, greedy, generator=torch.Generator().manual_seed(1))
-    assert first.shape == (12,) and torch.equal(first, again)
-    sampled = decoder.sample_frame(hidden, AudioSampling(top_k=4), history=first[None].repeat(5, 1))
-    assert sampled.shape == (12,) and int(sampled.min()) >= 0 and int(sampled.max()) < 17
+    first = decoder.sample_frames(hidden[:1], [greedy], [None], [torch.Generator().manual_seed(1)])[0]
+    history = first[None].repeat(5, 1)
+    samplings = [greedy, AudioSampling(top_k=4), AudioSampling(temperature=0.0, repetition_penalty=1e6), greedy]
+    histories = [None, history, history, history]
+
+    def generators():
+        return [
+            torch.Generator().manual_seed(1),
+            torch.Generator().manual_seed(2),
+            torch.Generator().manual_seed(1),
+            None,
+        ]
+
+    batch = decoder.sample_frames(hidden, samplings, histories, generators())
+    alone = [
+        decoder.sample_frames(hidden[i : i + 1], [samplings[i]], [histories[i]], [generators()[i]])[0] for i in range(3)
+    ]
+    assert batch.shape == (4, 12) and int(batch.min()) >= 0 and int(batch.max()) < 17
+    # Seeded rows sample the same frame whatever else is in the batch.
+    assert torch.equal(batch[:3], torch.stack(alone)) and torch.equal(batch[0], first)
+    # A code already in the window is pushed down: with a huge penalty greedy picks another one.
+    assert not (batch[2] == first).any()
 
 
 def _manager(**extra) -> SimpleNamespace:
@@ -149,8 +166,9 @@ class _ScriptedDepth:
     def __init__(self, frames):
         self.frames = list(frames)
 
-    def sample_frame(self, hidden, sampling, history, generator):
-        return self.frames.pop(0)
+    def sample_frames(self, hidden, samplings, histories, generators):
+        self.hidden = hidden
+        return torch.stack([self.frames.pop(0) for _ in range(hidden.shape[0])])
 
 
 def _stage0(frames) -> SimpleNamespace:
@@ -173,13 +191,13 @@ def _stage0(frames) -> SimpleNamespace:
 
 
 def _step(model, info, ids, **phase):
-    """One step of one request: preprocess -> postprocess -> make_omni_output -> compute_logits."""
+    """One step of one request: preprocess -> make_omni_output -> compute_logits."""
     hooks = model.hooks
     embeds = torch.zeros(len(ids), HIDDEN)
     _, embeds, updates = hooks.preprocess(model, torch.tensor(ids), embeds, **info, **phase)
     info.update(updates)
-    info.update(hooks.postprocess(model, torch.ones(len(ids), HIDDEN), **info))
-    out = hooks.make_omni_output(model, torch.ones(len(ids), HIDDEN), model_intermediate_buffer=[info])
+    hidden = torch.ones(len(ids), HIDDEN)
+    out = hooks.make_omni_output(model, hidden, model_intermediate_buffer=[info], request_token_spans=[(0, len(ids))])
     logits = hooks.compute_logits(model, torch.ones(1, HIDDEN))
     return embeds, out.multimodal_outputs["codes"]["audio"][0], logits[0]
 
@@ -207,10 +225,20 @@ def test_hooks_run_a_speech_turn_end_to_end():
     assert logits[WORD % VOCAB] == 0
 
 
-def test_forcing_follows_each_row_of_a_mixed_batch():
-    model = _stage0([])
+def test_a_mixed_batch_samples_speech_rows_only_from_their_last_token():
+    frame = torch.arange(12)
+    model = _stage0([frame])
     speech, text = {"lfm3_speech_slot": True}, {"lfm3_speech_slot": False}
-    model.hooks.make_omni_output(model, torch.ones(2, HIDDEN), model_intermediate_buffer=[text, speech])
+    hidden = torch.arange(3 * HIDDEN, dtype=torch.float32).reshape(3, HIDDEN)
+    # The text request has one token, the speech request two (a final prompt chunk).
+    out = model.hooks.make_omni_output(
+        model, hidden, model_intermediate_buffer=[text, speech], request_token_spans=[(0, 1), (1, 3)]
+    )
+    assert torch.equal(model.depth_decoder.hidden, hidden[2:3])
+    codes = out.multimodal_outputs["codes"]["audio"]
+    assert codes[0].shape == (12, 0) and torch.equal(codes[1], frame[:, None])
+    assert speech["lfm3_frame_pending"] and torch.equal(speech["lfm3_history"], frame[None])
+    assert "lfm3_frame_pending" not in text
     logits = model.hooks.compute_logits(model, torch.ones(2, HIDDEN))
     assert int(logits[1].argmax()) == TOKENS.audio_out and logits[0, TOKENS.audio_out] == float("-inf")
     # Forcing applies to the step it was set for only.
@@ -225,7 +253,11 @@ def test_invalid_audio_overrides_fall_back_and_zero_window_keeps_no_history():
     assert sampling == AudioSampling(temperature=0.5)
     assert model._audio_sampling({"audio_temperature": float("nan"), "audio_top_k": float("inf")}) == AudioSampling()
     info = {"lfm3_speech_slot": True, "audio_repetition_window": 0}
-    assert model.hooks.postprocess(model, torch.ones(1, HIDDEN), **info)["lfm3_history"] is None
+    out = model.hooks.make_omni_output(
+        model, torch.ones(1, HIDDEN), model_intermediate_buffer=[info], request_token_spans=[(0, 1)]
+    )
+    # The frame still goes to the codec; only the penalty window stays empty.
+    assert info["lfm3_history"] is None and out.multimodal_outputs["codes"]["audio"][0].shape == (12, 1)
 
 
 def test_codec_receives_every_sample_through_the_adapter():

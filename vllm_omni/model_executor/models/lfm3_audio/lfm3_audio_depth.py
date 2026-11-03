@@ -66,38 +66,65 @@ class Lfm3AudioDepthDecoder(nn.Module):
         return torch.stack([emb.logits(depth_out[:, k]) for k, emb in enumerate(self.depth_embeddings)], dim=1)
 
     @torch.inference_mode()
-    def sample_frame(
+    def sample_frames(
         self,
         hidden: torch.Tensor,
-        sampling: AudioSampling,
-        history: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
+        samplings: list[AudioSampling],
+        histories: list[torch.Tensor | None],
+        generators: list[torch.Generator | None],
     ) -> torch.Tensor:
-        """One frame ``[12]`` from one hidden state ``[H_lm]``.
+        """One frame ``[B, 12]`` per hidden state ``[B, H_lm]``, all requests in one depth pass per step.
 
-        ``history [frames, 12]`` holds earlier frames of the request for the
-        per-codebook repetition penalty.
+        ``histories[i] [frames, 12]`` holds earlier frames of request ``i`` for the per-codebook repetition
+        penalty. Every random draw of a row comes from that row's generator (or the global one), so a seeded
+        request samples the same frame whatever else is in the batch.
         """
-        hidden = hidden.reshape(1, -1)
-        device = hidden.device
-        codes = torch.zeros((1, self.num_codebooks), dtype=torch.long, device=device)
+        rows, k, device = hidden.shape[0], self.num_codebooks, hidden.device
+        vocab = self.depth_embeddings[0].embedding.num_embeddings
+        # A code seen in the window is penalized once, whatever its count.
+        seen = torch.zeros((rows, k, vocab), dtype=torch.bool, device=device)
+        for i, history in enumerate(histories):
+            if history is not None and history.numel() and samplings[i].repetition_penalty != 1.0:
+                seen[i].scatter_(1, history.T.to(device), True)
+        penalty = to_device([s.repetition_penalty for s in samplings], device, torch.float32)[:, None, None]
+        temperature = to_device([s.temperature for s in samplings], device, torch.float32)[:, None, None]
+        greedy = temperature[:, 0, 0] == 0
+        top_k = [min(s.top_k, vocab) if s.top_k else vocab for s in samplings]
+        kth_index = to_device([k - 1 for k in top_k], device, torch.long)[:, None, None]
+
+        codes = torch.zeros((rows, k), dtype=torch.long, device=device)
         revealed = torch.zeros_like(codes, dtype=torch.bool)
-        order = torch.randperm(self.num_codebooks, device=device, generator=generator)
-        for pick in order.split(self.schedule):
-            scores = self(hidden, codes, ~revealed)[0, pick].float()  # [len(pick), codebook_size]
-            if history is not None and history.numel() and sampling.repetition_penalty != 1.0:
-                seen = history[:, pick].T  # [len(pick), frames]
-                score = scores.gather(1, seen)
-                score = torch.where(score < 0, score * sampling.repetition_penalty, score / sampling.repetition_penalty)
-                scores = scores.scatter(1, seen, score)
-            if sampling.temperature == 0:
-                drawn = scores.argmax(-1)
-            else:
-                scores = scores / sampling.temperature
-                if sampling.top_k:
-                    kth = scores.topk(min(sampling.top_k, scores.shape[-1]), dim=-1).values[:, -1:]
-                    scores = scores.masked_fill(scores < kth, float("-inf"))
-                drawn = torch.multinomial(scores.softmax(-1), 1, generator=generator)[:, 0]
-            codes[0, pick] = drawn
-            revealed[0, pick] = True
-        return codes[0]
+        order = _draw(generators, (k,), device, torch.Tensor.uniform_).argsort(-1)  # a random order per row
+        start = 0
+        for size in self.schedule:
+            pick = order[:, start : start + size]
+            start += size
+            scores = self(hidden, codes, ~revealed).float().gather(1, pick[..., None].expand(-1, -1, vocab))
+            penalized = torch.where(scores < 0, scores * penalty, scores / penalty)
+            scores = torch.where(seen.gather(1, pick[..., None].expand(-1, -1, vocab)), penalized, scores)
+            scaled = scores / temperature.clamp_min(1e-5)
+            kth = scaled.topk(max(top_k), dim=-1).values.gather(-1, kth_index.expand(-1, size, 1))
+            probs = scaled.masked_fill(scaled < kth, float("-inf")).softmax(-1)
+            # Exponential race: argmax(p / E) with E ~ Exp(1) draws from p.
+            drawn = (probs / _draw(generators, (size, vocab), device, torch.Tensor.exponential_)).argmax(-1)
+            drawn = torch.where(greedy[:, None], scores.argmax(-1), drawn)
+            codes.scatter_(1, pick, drawn)
+            revealed.scatter_(1, pick, True)
+        return codes
+
+
+def to_device(values: list, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A small host list on ``device`` without a stream sync (a pageable host copy waits for the GPU)."""
+    host = torch.tensor(values, dtype=dtype, pin_memory=device.type == "cuda")
+    return host.to(device, non_blocking=True)
+
+
+def _draw(generators: list[torch.Generator | None], shape: tuple[int, ...], device, fill) -> torch.Tensor:
+    """Per-row random tensor ``[rows, *shape]``: seeded rows draw from their own generator."""
+    out = torch.empty((len(generators), *shape), device=device)
+    if any(generator is None for generator in generators):
+        fill(out)
+    for i, generator in enumerate(generators):
+        if generator is not None:
+            fill(out[i], generator=generator)
+    return out
