@@ -29,7 +29,6 @@ prompt ending on `<|audio_start|>` is answered in speech, one ending on
 ## References
 
 - Model card: [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B)
-- Offline example: [`examples/offline_inference/lfm3_audio/`](../../examples/offline_inference/lfm3_audio/)
 - Online example: [`examples/online_serving/lfm3_audio/`](../../examples/online_serving/lfm3_audio/)
 
 ## Hardware Support
@@ -70,6 +69,59 @@ curl -s http://localhost:8091/v1/audio/speech -H "Content-Type: application/json
 `Hebrew`, `Italian`, `Japanese`, `Korean`, `Polish`, `Portuguese`, `Spanish`,
 `Swedish`, `Turkish`). There is no voice cloning. Voice chat goes through
 `/v1/chat/completions`; see the online example.
+
+#### Offline inference
+
+The prompt follows the model card: a system prompt names the task and the
+assistant turn is prefilled with the marker of the reply's mode.
+
+| Task | System prompt | User turn | Assistant prefill |
+| --- | --- | --- | --- |
+| Text to speech | `Perform TTS in <language> using a <female\|male> voice.` | text | `<\|audio_start\|>` |
+| Voice chat | `Respond with interleaved text and audio.` | `<\|audio\|>` or text | `<\|mixed_start\|>` |
+| ASR | `Perform ASR in <language>.` (or `Perform ASR.`) | `<\|audio\|>` | none |
+
+```python
+import soundfile as sf
+import torch
+from vllm import SamplingParams
+from vllm.assets.audio import AudioAsset
+
+from vllm_omni.entrypoints.omni import Omni
+
+
+def turn(system: str, user: str, prefill: str) -> str:
+    return (
+        f"<|startoftext|><|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{prefill}"
+    )
+
+
+if __name__ == "__main__":
+    omni = Omni(model="LiquidAI/LFM3-Audio-2B", trust_remote_code=True)
+    prompts = [
+        {"prompt": turn("Perform TTS in American English using a female voice.", "Cows eat hay in the morning.", "<|audio_start|>")},
+        {
+            # One <|audio|> per clip; the processor expands it to the encoder's 12.5 Hz frames.
+            "prompt": turn("Respond with interleaved text and audio.", "<|audio|>", "<|mixed_start|>"),
+            "multi_modal_data": {"audio": AudioAsset("mary_had_lamb").audio_and_sample_rate},
+        },
+    ]
+    # Text is decoded greedily; speech frames use the checkpoint's audio sampling settings.
+    params = [SamplingParams(temperature=0.0, max_tokens=2048), SamplingParams(temperature=0.0, max_tokens=8192)]
+    for output in omni.generate(prompts, params):
+        if output.final_output_type == "text":
+            print(output.request_id, output.outputs[0].text)
+        else:
+            audio = output.outputs[0].multimodal_output["audio"]
+            audio = torch.cat([a.reshape(-1) for a in audio]) if isinstance(audio, list) else audio.reshape(-1)
+            sf.write(f"reply_{output.request_id}.wav", audio.float().cpu().numpy(), 24000)
+    omni.close()
+```
+
+For ASR alone, pass `deploy_config="vllm_omni/deploy/lfm3_audio_text.yaml"`
+to `Omni` and a single `SamplingParams`: the language model runs without the
+codec.
 
 #### Notes
 

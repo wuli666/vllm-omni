@@ -338,7 +338,14 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
             overrides[field] = value
         return AudioSampling(**overrides)
 
-    def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(
+        self,
+        model_outputs: torch.Tensor | OmniOutput,
+        *,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
+        request_token_spans: list[tuple[int, int]] | None = None,
+        **_: object,
+    ) -> OmniOutput:
         """Sample this step's speech frames, all speech slots of the batch in one depth decoder pass.
 
         ``model_intermediate_buffer`` holds the live request buffers in batch order: the frame state written
@@ -346,12 +353,13 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
-        infos = kwargs.get("model_intermediate_buffer") or []
+        infos = model_intermediate_buffer or []
         empty = model_outputs.new_empty((self.config.num_codebooks, 0), dtype=torch.long)
         frames = [empty] * len(infos)
         speech = [i for i, info in enumerate(infos) if info.get("lfm3_speech_slot")]
         if speech:
-            spans = kwargs["request_token_spans"]
+            assert request_token_spans is not None, "the MRV2 runner passes request_token_spans"
+            spans = request_token_spans
             last = to_device([spans[i][1] - 1 for i in speech], model_outputs.device, torch.long)
             samplings = [self._audio_sampling(infos[i]) for i in speech]
             codes = self.depth_decoder.sample_frames(

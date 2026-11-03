@@ -2,7 +2,7 @@
 # Stage 0 (language model + depth decoder) streams 12-codebook frames to the
 # Liquid codec (stage 1) in windows of 2, 4 and 8 frames for an early first
 # packet, then 12 frames (~1 s). Prompts end on <|audio_start|> (speech) or
-# <|mixed_start|> (interleaved text and speech); see examples/offline_inference/lfm3_audio.
+# <|mixed_start|> (interleaved text and speech); see recipes/LiquidAI/LFM3-Audio.md.
 model_runner: v2
 async_chunk: true
 trust_remote_code: true

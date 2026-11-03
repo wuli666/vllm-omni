@@ -1,5 +1,5 @@
 # LFM3-Audio: speech / text in -> text out (ASR, spoken QA), single GPU.
-# Prompts carry one <|audio|> per clip; see examples/offline_inference/lfm3_audio.
+# Prompts carry one <|audio|> per clip; see recipes/LiquidAI/LFM3-Audio.md.
 pipeline: lfm3_audio_text
 trust_remote_code: true
 async_chunk: false
