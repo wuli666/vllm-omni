@@ -46,7 +46,7 @@ LFM3_AUDIO_PIPELINE = PipelineConfig(
         ),
         StagePipelineConfig(
             stage_id=1,
-            model_stage="code2wav",
+            model_stage="lfm3_audio_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
