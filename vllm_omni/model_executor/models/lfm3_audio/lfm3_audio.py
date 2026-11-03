@@ -34,6 +34,7 @@ from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.inputs import MultiModalDataDict
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -71,6 +72,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .lfm3_audio_depth import AudioSampling, Lfm3AudioDepthDecoder
 from .lfm3_audio_encoder import Lfm3AudioEncoder, Lfm3AudioProjector
 from .lfm3_audio_modes import Lfm3AudioModeState, Lfm3AudioTokens
+
+logger = init_logger(__name__)
 
 AUDIO_PLACEHOLDER = "<|audio|>"
 # Request-buffer keys of device tensors, kept on the GPU between steps.
@@ -252,6 +255,9 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
 
         # Speech output runs on a stage that hands frames on; a text stage keeps the reply in text.
         self.speech_output = getattr(vllm_config.model_config, "engine_output_type", "text") != "text"
+        if self.speech_output and vllm_config.speculative_config is not None:
+            # Speech slots are decided, sampled and fed back one token per step.
+            raise NotImplementedError("LFM3-Audio speech output does not support speculative decoding")
         self.has_preprocess = self.has_postprocess = self.have_multimodal_outputs = self.speech_output
         # preprocess only rewrites decode rows: prompt rows keep the encoder's speech embeddings.
         self.preprocess_keeps_mm_inputs = self.speech_output
@@ -313,7 +319,7 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
         end_of_audio = bool((codes == self.audio_eos_code).any())
         if end_of_audio:
             codes = torch.full_like(codes, self.audio_eos_code)
-        else:
+        elif sampling.repetition_window:
             # ponytail: the window is re-snapshotted each frame; keep per-codebook counts if long replies get slow.
             history = codes[None] if history is None else torch.cat((history.to(codes.device), codes[None]))
             history = history[-sampling.repetition_window :]
@@ -329,13 +335,28 @@ class Lfm3AudioForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsP
 
     @staticmethod
     def _audio_sampling(info: dict[str, Any]) -> AudioSampling:
-        """Defaults of the checkpoint's generation_config; ``audio_<field>`` in additional information overrides."""
+        """Defaults of the checkpoint's generation_config; ``audio_<field>`` in additional information overrides.
+
+        This runs inside the step for the whole batch, so an invalid override falls back to the
+        default with a warning instead of raising.
+        """
         overrides = {}
         for field in _AUDIO_SAMPLING_KEYS:
             value = info.get(f"audio_{field}")
             value = value[0] if isinstance(value, list | tuple) and value else value
-            if value is not None:
-                overrides[field] = type(getattr(AudioSampling, field))(value)
+            if value is None:
+                continue
+            try:
+                value = type(getattr(AudioSampling, field))(value)
+            except (TypeError, ValueError, OverflowError):
+                value = None
+            # temperature 0 is greedy, top_k / repetition_window 0 disable them; a penalty must stay positive.
+            # ``not value >= 0`` also rejects NaN.
+            if value is None or not value >= 0 or (field == "repetition_penalty" and value == 0):
+                # warning_once caches its arguments, so they must be hashable.
+                logger.warning_once("LFM3-Audio: ignoring invalid audio_%s=%s", field, repr(info.get(f"audio_{field}")))
+                continue
+            overrides[field] = value
         return AudioSampling(**overrides)
 
     def make_omni_output(self, model_outputs: Any, **kwargs: Any) -> OmniOutput:

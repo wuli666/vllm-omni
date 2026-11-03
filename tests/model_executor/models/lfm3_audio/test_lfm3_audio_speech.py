@@ -126,6 +126,8 @@ def test_windows_ramp_up_and_hold_back_the_newest_frame():
     assert sent == [[0, 1], [2, 3, 4], [5, 6, 7, 8]]
     last = lfm3_audio_to_codec_async_chunk(manager, {"codes": {"audio": torch.empty(12, 0)}}, request, True)
     assert bool(last.meta.finished) and last.codes.audio[0].tolist() == [9, 10, 11]
+    # ``finished`` stays with the receiver's scheduler; the codec reads ``stream_finished``.
+    assert bool(last.meta.stream_finished)
     assert lfm3_audio_to_codec_async_chunk(manager, _frame(12), request, True) is None
 
 
@@ -134,3 +136,117 @@ def test_text_only_reply_still_closes_the_stream():
     assert lfm3_audio_to_codec_async_chunk(manager, {}, request) is None
     last = lfm3_audio_to_codec_async_chunk(manager, {}, request, True)
     assert bool(last.meta.finished) and last.codes.audio.shape == (12, 0)
+
+
+# ---------------------------------------------------------------------------
+# Stage-0 hooks together, on a stand-in for the model (no vLLM engine needed)
+# ---------------------------------------------------------------------------
+
+AUDIO_IN, VOCAB, HIDDEN, EOS_CODE = 9, 20, 8, 16
+
+
+class _ScriptedDepth:
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    def sample_frame(self, hidden, sampling, history, generator):
+        return self.frames.pop(0)
+
+
+def _stage0(frames) -> SimpleNamespace:
+    from vllm_omni.model_executor.models.lfm3_audio.lfm3_audio import Lfm3AudioForConditionalGeneration as Model
+
+    torch.manual_seed(0)
+    return SimpleNamespace(
+        tokens=TOKENS,
+        audio_eos_code=EOS_CODE,
+        depth_decoder=_ScriptedDepth(frames),
+        codebook_embedding=torch.nn.Embedding(12 * 17, HIDDEN),
+        codebook_offsets=torch.arange(12) * 17,
+        config=SimpleNamespace(num_codebooks=12),
+        never_sampled=torch.tensor([AUDIO_IN, TOKENS.audio_out]),
+        _forced_tokens=None,
+        language_model=SimpleNamespace(compute_logits=lambda h: torch.zeros(h.shape[0], VOCAB)),
+        _audio_sampling=Model._audio_sampling,
+        hooks=Model,
+    )
+
+
+def _step(model, info, ids, **phase):
+    """One step of one request: preprocess -> postprocess -> make_omni_output -> compute_logits."""
+    hooks = model.hooks
+    embeds = torch.zeros(len(ids), HIDDEN)
+    _, embeds, updates = hooks.preprocess(model, torch.tensor(ids), embeds, **info, **phase)
+    info.update(updates)
+    info.update(hooks.postprocess(model, torch.ones(len(ids), HIDDEN), **info))
+    out = hooks.make_omni_output(model, torch.ones(len(ids), HIDDEN), model_intermediate_buffer=[info])
+    logits = hooks.compute_logits(model, torch.ones(1, HIDDEN))
+    return embeds, out.multimodal_outputs["codes"]["audio"][0], logits[0]
+
+
+def test_hooks_run_a_speech_turn_end_to_end():
+    frame = torch.arange(12)
+    model, info = _stage0([frame, torch.full((12,), EOS_CODE)]), {"req_id": "r"}
+    prefill = dict(_omni_is_prefill=True, _omni_prompt_len=3)
+    # An earlier prompt chunk keeps no sample and decides nothing.
+    _, _, updates = model.hooks.preprocess(model, torch.tensor([5, 6]), torch.zeros(2, HIDDEN), **prefill)
+    assert updates == {}
+    # A one-token final prompt chunk ending on <|audio_start|> opens a speech slot.
+    _, codes, logits = _step(model, info, [TOKENS.audio_start], _omni_num_computed_tokens=2, **prefill)
+    assert torch.equal(codes, frame[:, None]) and int(logits.argmax()) == TOKENS.audio_out
+    decode = dict(_omni_is_prefill=False, _omni_prompt_len=3)
+    # The frame is fed back as its summed code embeddings; the next slot ends the audio.
+    expected = model.codebook_embedding(frame + model.codebook_offsets).sum(0)
+    embeds, codes, logits = _step(model, info, [TOKENS.audio_out], _omni_num_computed_tokens=3, **decode)
+    torch.testing.assert_close(embeds[0], expected)
+    assert codes.shape == (12, 0) and info["lfm3_mode"] == TEXT
+    # After the end-of-audio frame the slot is text: nothing forced, placeholders never sampled.
+    _, codes, logits = _step(model, info, [TOKENS.audio_out], _omni_num_computed_tokens=4, **decode)
+    assert codes.shape == (12, 0) and not info["lfm3_speech_slot"]
+    assert logits[TOKENS.audio_out] == float("-inf") and logits[AUDIO_IN] == float("-inf")
+    assert logits[WORD % VOCAB] == 0
+
+
+def test_forcing_follows_each_row_of_a_mixed_batch():
+    model = _stage0([])
+    speech, text = {"lfm3_speech_slot": True}, {"lfm3_speech_slot": False}
+    model.hooks.make_omni_output(model, torch.ones(2, HIDDEN), model_intermediate_buffer=[text, speech])
+    logits = model.hooks.compute_logits(model, torch.ones(2, HIDDEN))
+    assert int(logits[1].argmax()) == TOKENS.audio_out and logits[0, TOKENS.audio_out] == float("-inf")
+    # Forcing applies to the step it was set for only.
+    assert model._forced_tokens is None
+
+
+def test_invalid_audio_overrides_fall_back_and_zero_window_keeps_no_history():
+    model = _stage0([torch.arange(12)])
+    sampling = model._audio_sampling(
+        {"audio_top_k": [-1], "audio_temperature": 0.5, "audio_repetition_penalty": 0, "audio_repetition_window": "x"}
+    )
+    assert sampling == AudioSampling(temperature=0.5)
+    assert model._audio_sampling({"audio_temperature": float("nan"), "audio_top_k": float("inf")}) == AudioSampling()
+    info = {"lfm3_speech_slot": True, "audio_repetition_window": 0}
+    assert model.hooks.postprocess(model, torch.ones(1, HIDDEN), **info)["lfm3_history"] is None
+
+
+def test_codec_receives_every_sample_through_the_adapter():
+    """Processor windows, as the receiver hands them to the codec (``finished`` is not forwarded)."""
+    from vllm_omni.model_executor.models.lfm3_audio.lfm3_audio_code2wav import Lfm3AudioCode2Wav
+    from vllm_omni.transformers_utils.configs.lfm3_audio import LiquidCodecConfig
+
+    torch.manual_seed(0)
+    codec = Lfm3AudioCode2Wav(vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=LiquidCodecConfig())))
+    for param in codec.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    codec = codec.float().eval()
+    manager, request = _manager(), SimpleNamespace(request_id="r")
+    num_frames, samples = 9, 0
+    for step in range(num_frames + 1):
+        done = step == num_frames
+        output = {} if done else {"codes": {"audio": torch.randint(0, 2016, (12, 1))}}
+        payload = lfm3_audio_to_codec_async_chunk(manager, output, request, done)
+        if payload is None:
+            continue
+        info = {"codes": {"audio": payload.codes.audio}, "meta": {"stream_finished": payload.meta.stream_finished}}
+        out = codec(runtime_additional_information=[info], seq_token_counts=[1], request_ids=["r"])
+        samples += out.multimodal_outputs["model_outputs"][0].numel()
+    assert samples == num_frames * 1920 and not codec._streams

@@ -40,6 +40,9 @@ LFM3_AUDIO_PIPELINE = PipelineConfig(
             model_arch="Lfm3AudioForConditionalGeneration",
             async_chunk_process_next_stage_input_func=f"{_PROC}.lfm3_audio_to_codec_async_chunk",
             sampling_constraints={"detokenize": True, "ignore_eos": True, "stop_token_ids": [_IM_END]},
+            # A replayed <|audio_out|> cannot rebuild the frame embedding it stood for, and the mode
+            # machine and sampling history live in the dropped request buffer: fail instead.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

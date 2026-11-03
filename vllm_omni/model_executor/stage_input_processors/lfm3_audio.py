@@ -79,10 +79,7 @@ def lfm3_audio_to_codec_async_chunk(
         state["done"] = True
         pending = state.pop("frames")
         codes = torch.cat(pending, dim=-1) if pending else torch.empty((NUM_CODEBOOKS, 0), dtype=torch.long)
-        return OmniPayloadStruct(
-            codes=CodesStruct(audio=codes.contiguous()),
-            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
-        )
+        return OmniPayloadStruct(codes=CodesStruct(audio=codes.contiguous()), meta=_meta(True))
     ramp, chunk = _config(transfer_manager)
     target = ramp[state["windows"]] if state["windows"] < len(ramp) else chunk
     pending = sum(f.shape[-1] for f in state["frames"])
@@ -92,10 +89,14 @@ def lfm3_audio_to_codec_async_chunk(
     window = torch.cat(state["frames"], dim=-1)
     state["frames"] = [window[:, -1:]]
     state["windows"] += 1
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=window[:, :-1].contiguous()),
-        meta=MetaStruct(finished=torch.tensor(False, dtype=torch.bool)),
-    )
+    return OmniPayloadStruct(codes=CodesStruct(audio=window[:, :-1].contiguous()), meta=_meta(False))
+
+
+def _meta(finished: bool) -> MetaStruct:
+    # ``finished`` drives the receiver's scheduling and is not handed to the model;
+    # ``stream_finished`` reaches the codec, which flushes its overlap-add tail on it.
+    flag = torch.tensor(finished, dtype=torch.bool)
+    return MetaStruct(finished=flag, stream_finished=flag.clone())
 
 
 __all__ = ["lfm3_audio_to_codec_async_chunk"]
