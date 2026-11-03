@@ -80,8 +80,10 @@ curl -s http://localhost:8091/v1/audio/speech -H "Content-Type: application/json
 - Speech streams to the codec in windows of 2, 4 and 8 frames, then 12
   frames (about 1 s); `codec_chunk_ramp` and `codec_chunk_frames` in the
   deploy config change them.
-- Measured (one request, RTX 4090 48 GB): streamed speech starts after
-  0.11 s and 4.5 s of speech take 1.2 s.
+- Measured on one RTX 4090 48 GB: streamed speech starts after 0.11 s;
+  one request speaks at 3.9x real time, 16 concurrent requests at 41x real
+  time in total (2.6x each). The speech frames of all requests in a step are
+  sampled in one depth decoder pass.
 - Speech output requests that are preempted fail instead of being
   recomputed: give the stage enough KV cache for `max_num_seqs` replies.
 - Speech frames are sampled with the checkpoint's audio settings

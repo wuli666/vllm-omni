@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from typing import Any
 
 import numpy as np
 import pytest
@@ -37,7 +38,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 
 def _prompt(system: str, user: str, prefill: str = "", audio: bool = False) -> dict:
-    prompt = {
+    prompt: dict[str, Any] = {
         "prompt": f"<|startoftext|><|im_start|>system\n{system}<|im_end|>\n"
         f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{prefill}"
     }
@@ -68,7 +69,7 @@ def test_speech_reaches_the_codec_frame_for_frame(omni_runner: OmniRunner, run_l
         _prompt("Perform TTS in American English using a female voice.", "Cows eat hay.", "<|audio_start|>"),
         _prompt("Respond with interleaved text and audio.", "<|audio|>", "<|mixed_start|>", audio=True),
     ]
-    replies = defaultdict(dict)
+    replies: defaultdict[str, dict[str, Any]] = defaultdict(dict)
     for output in omni_runner.omni.generate(prompts):
         reply = replies[output.request_id]
         if output.final_output_type == "text":
